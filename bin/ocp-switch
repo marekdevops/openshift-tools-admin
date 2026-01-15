@@ -1,0 +1,128 @@
+#!/bin/bash
+#
+# ocp-switch - Skrypt do przełączania między klastrami OpenShift
+# Użycie: ocp-switch [nazwa-klastra]
+#         ocp-switch (bez argumentów - lista dostępnych klastrów)
+#
+
+KUBE_DIR="${KUBE_CLUSTERS_DIR:-$HOME/.kube/clusters}"
+TOKENS_DIR="${KUBE_TOKENS_DIR:-$HOME/.kube/tokens}"
+
+# Kolory
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+show_help() {
+    echo "Użycie: ocp-switch [OPCJE] [nazwa-klastra]"
+    echo ""
+    echo "Opcje:"
+    echo "  -l, --list     Pokaż dostępne klastry"
+    echo "  -c, --current  Pokaż aktualny klaster"
+    echo "  -h, --help     Pokaż tę pomoc"
+    echo ""
+    echo "Przykłady:"
+    echo "  ocp-switch prod-cluster1"
+    echo "  ocp-switch -l"
+    echo "  source ocp-switch dev-cluster  # aby export KUBECONFIG działał w bieżącej sesji"
+}
+
+list_clusters() {
+    echo -e "${BLUE}Dostępne klastry:${NC}"
+    echo ""
+
+    for cluster in "$KUBE_DIR"/*; do
+        if [[ -f "$cluster" ]]; then
+            name=$(basename "$cluster")
+
+            # Sprawdź czy to aktualny kontekst
+            if [[ "$KUBECONFIG" == "$cluster" ]]; then
+                echo -e "  ${GREEN}* $name${NC} (aktywny)"
+            else
+                echo "    $name"
+            fi
+        fi
+    done
+
+    echo ""
+    echo -e "${YELLOW}Aktualny KUBECONFIG:${NC} ${KUBECONFIG:-nie ustawiony}"
+}
+
+show_current() {
+    if [[ -z "$KUBECONFIG" ]]; then
+        echo -e "${YELLOW}KUBECONFIG nie jest ustawiony${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}Aktualny klaster:${NC}"
+    echo -e "  KUBECONFIG: $KUBECONFIG"
+    echo ""
+
+    if command -v oc &> /dev/null; then
+        echo -e "  Użytkownik: $(oc whoami 2>/dev/null || echo 'nie zalogowany')"
+        echo -e "  Projekt:    $(oc project -q 2>/dev/null || echo 'brak')"
+        echo -e "  API:        $(oc whoami --show-server 2>/dev/null || echo 'nieznany')"
+    fi
+}
+
+switch_cluster() {
+    local cluster_name="$1"
+    local cluster_file="$KUBE_DIR/$cluster_name"
+
+    if [[ ! -f "$cluster_file" ]]; then
+        echo -e "${RED}Błąd: Klaster '$cluster_name' nie istnieje${NC}"
+        echo ""
+        list_clusters
+        return 1
+    fi
+
+    # Eksportuj KUBECONFIG
+    export KUBECONFIG="$cluster_file"
+
+    # Wyświetl informację
+    echo -e "${GREEN}Przełączono na klaster: $cluster_name${NC}"
+    echo ""
+
+    # Sprawdź połączenie
+    if command -v oc &> /dev/null; then
+        local user=$(oc whoami 2>/dev/null)
+        if [[ -n "$user" ]]; then
+            echo -e "  Użytkownik: ${GREEN}$user${NC}"
+            echo -e "  Projekt:    $(oc project -q 2>/dev/null)"
+            echo -e "  API:        $(oc whoami --show-server 2>/dev/null)"
+        else
+            echo -e "${YELLOW}Uwaga: Nie można zweryfikować połączenia. Możliwe, że token wygasł.${NC}"
+            echo "Użyj: ocp-login $cluster_name"
+        fi
+    fi
+
+    # Ostrzeżenie dla klastrów produkcyjnych
+    if [[ "$cluster_name" == *prod* ]]; then
+        echo ""
+        echo -e "${RED}⚠️  UWAGA: Pracujesz na środowisku PRODUKCYJNYM!${NC}"
+    fi
+}
+
+# Sprawdź czy katalog z klastrami istnieje
+if [[ ! -d "$KUBE_DIR" ]]; then
+    echo -e "${YELLOW}Tworzenie katalogu $KUBE_DIR...${NC}"
+    mkdir -p "$KUBE_DIR"
+fi
+
+# Parsowanie argumentów
+case "${1:-}" in
+    -h|--help)
+        show_help
+        ;;
+    -l|--list|"")
+        list_clusters
+        ;;
+    -c|--current)
+        show_current
+        ;;
+    *)
+        switch_cluster "$1"
+        ;;
+esac

@@ -1,0 +1,187 @@
+#!/bin/bash
+#
+# ocp-login - Skrypt do logowania do klastrów OpenShift
+# Użycie: ocp-login [nazwa-klastra]
+#
+
+KUBE_DIR="${KUBE_CLUSTERS_DIR:-$HOME/.kube/clusters}"
+TOKENS_DIR="${KUBE_TOKENS_DIR:-$HOME/.kube/tokens}"
+CLUSTER_CONFIG="$HOME/.kube/cluster-registry.conf"
+
+# Kolory
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+show_help() {
+    echo "Użycie: ocp-login [OPCJE] [nazwa-klastra]"
+    echo ""
+    echo "Opcje:"
+    echo "  -a, --add      Dodaj nowy klaster do rejestru"
+    echo "  -l, --list     Pokaż zarejestrowane klastry"
+    echo "  -h, --help     Pokaż tę pomoc"
+    echo ""
+    echo "Przykłady:"
+    echo "  ocp-login prod-cluster1"
+    echo "  ocp-login --add"
+}
+
+# Ładowanie konfiguracji klastrów
+load_cluster_config() {
+    if [[ -f "$CLUSTER_CONFIG" ]]; then
+        source "$CLUSTER_CONFIG"
+    fi
+}
+
+# Zapisywanie konfiguracji klastrów
+save_cluster_config() {
+    local name="$1"
+    local api="$2"
+
+    echo "CLUSTER_API_${name//-/_}=\"$api\"" >> "$CLUSTER_CONFIG"
+}
+
+# Pobierz API URL dla klastra
+get_cluster_api() {
+    local name="$1"
+    local var_name="CLUSTER_API_${name//-/_}"
+    echo "${!var_name}"
+}
+
+# Dodaj nowy klaster
+add_cluster() {
+    echo -e "${BLUE}Dodawanie nowego klastra${NC}"
+    echo ""
+
+    read -p "Nazwa klastra (np. prod-cluster1): " cluster_name
+    read -p "API URL (np. https://api.cluster.example.com:6443): " cluster_api
+
+    if [[ -z "$cluster_name" || -z "$cluster_api" ]]; then
+        echo -e "${RED}Błąd: Nazwa i API URL są wymagane${NC}"
+        return 1
+    fi
+
+    save_cluster_config "$cluster_name" "$cluster_api"
+    echo -e "${GREEN}Klaster '$cluster_name' został dodany${NC}"
+    echo ""
+    echo "Teraz możesz zalogować się: ocp-login $cluster_name"
+}
+
+# Lista zarejestrowanych klastrów
+list_clusters() {
+    echo -e "${BLUE}Zarejestrowane klastry:${NC}"
+    echo ""
+
+    if [[ -f "$CLUSTER_CONFIG" ]]; then
+        grep "^CLUSTER_API_" "$CLUSTER_CONFIG" | while read line; do
+            name=$(echo "$line" | sed 's/CLUSTER_API_//' | cut -d'=' -f1 | tr '_' '-')
+            api=$(echo "$line" | cut -d'=' -f2 | tr -d '"')
+            echo "  $name -> $api"
+        done
+    else
+        echo "  Brak zarejestrowanych klastrów. Użyj: ocp-login --add"
+    fi
+}
+
+# Logowanie do klastra
+login_cluster() {
+    local cluster_name="$1"
+    local cluster_file="$KUBE_DIR/$cluster_name"
+    local token_file="$TOKENS_DIR/$cluster_name"
+
+    load_cluster_config
+
+    # Pobierz API URL
+    local api_url=$(get_cluster_api "$cluster_name")
+
+    if [[ -z "$api_url" ]]; then
+        echo -e "${YELLOW}Klaster '$cluster_name' nie jest zarejestrowany.${NC}"
+        read -p "Podaj API URL: " api_url
+
+        if [[ -z "$api_url" ]]; then
+            echo -e "${RED}API URL jest wymagany${NC}"
+            return 1
+        fi
+
+        read -p "Zapisać ten klaster? (t/n): " save_choice
+        if [[ "$save_choice" == "t" ]]; then
+            save_cluster_config "$cluster_name" "$api_url"
+        fi
+    fi
+
+    # Sprawdź czy mamy zapisany token
+    local token=""
+    if [[ -f "$token_file" ]]; then
+        token=$(cat "$token_file")
+        echo -e "${BLUE}Używam zapisanego tokena z $token_file${NC}"
+    else
+        echo -e "${YELLOW}Brak zapisanego tokena.${NC}"
+        echo "Podaj token (możesz go uzyskać z: oc whoami -t)"
+        read -sp "Token: " token
+        echo ""
+
+        if [[ -z "$token" ]]; then
+            echo -e "${RED}Token jest wymagany${NC}"
+            return 1
+        fi
+
+        read -p "Zapisać token do $token_file? (t/n): " save_token
+        if [[ "$save_token" == "t" ]]; then
+            mkdir -p "$TOKENS_DIR"
+            chmod 700 "$TOKENS_DIR"
+            echo "$token" > "$token_file"
+            chmod 600 "$token_file"
+            echo -e "${GREEN}Token zapisany${NC}"
+        fi
+    fi
+
+    # Utwórz katalog na kubeconfig
+    mkdir -p "$KUBE_DIR"
+
+    # Logowanie
+    echo -e "${BLUE}Logowanie do $cluster_name...${NC}"
+
+    oc login "$api_url" \
+        --token="$token" \
+        --kubeconfig="$cluster_file" \
+        --insecure-skip-tls-verify=false
+
+    if [[ $? -eq 0 ]]; then
+        echo ""
+        echo -e "${GREEN}Zalogowano pomyślnie!${NC}"
+        echo ""
+        echo "Aby przełączyć się na ten klaster, użyj:"
+        echo "  source ocp-switch $cluster_name"
+        echo ""
+        echo "Lub dodaj do ~/.bashrc:"
+        echo "  alias k${cluster_name//-/}='export KUBECONFIG=$cluster_file'"
+    else
+        echo -e "${RED}Błąd logowania${NC}"
+        return 1
+    fi
+}
+
+# Upewnij się, że katalogi istnieją
+mkdir -p "$KUBE_DIR" "$TOKENS_DIR"
+chmod 700 "$TOKENS_DIR"
+
+# Parsowanie argumentów
+case "${1:-}" in
+    -h|--help)
+        show_help
+        ;;
+    -a|--add)
+        add_cluster
+        ;;
+    -l|--list)
+        list_clusters
+        ;;
+    "")
+        show_help
+        ;;
+    *)
+        login_cluster "$1"
+        ;;
+esac

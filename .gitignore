@@ -1,0 +1,13 @@
+# Tokens and secrets
+*.token
+tokens/
+
+# Local config overrides
+*.local
+
+# IDE
+.idea/
+.vscode/
+
+# Claude settings
+.claude/

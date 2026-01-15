@@ -1,0 +1,87 @@
+# Starship configuration for OpenShift cluster management
+# Skopiuj do: ~/.config/starship.toml
+
+# Format promptu
+format = """
+$username\
+$hostname\
+$directory\
+$git_branch\
+$git_status\
+$kubernetes\
+$cmd_duration\
+$line_break\
+$character"""
+
+# Kubernetes/OpenShift context - NAJWAŻNIEJSZE!
+[kubernetes]
+disabled = false
+format = '[$symbol$context( \($namespace\))]($style) '
+style = "bold blue"
+symbol = "☸ "
+
+# Aliasy dla kontekstów - dostosuj do swoich klastrów!
+# Nazwa kontekstu to nazwa pliku w ~/.kube/clusters/
+[kubernetes.context_aliases]
+# Produkcja - CZERWONY (ostrzeżenie!)
+"prod-cluster1" = "🔴 PROD-1"
+"prod-cluster2" = "🔴 PROD-2"
+"production" = "🔴 PROD"
+
+# Staging - ŻÓŁTY
+"staging-cluster" = "🟡 STAGE"
+"staging" = "🟡 STAGE"
+"stg" = "🟡 STG"
+
+# Development - ZIELONY (bezpieczne)
+"dev-cluster" = "🟢 DEV"
+"development" = "🟢 DEV"
+"dev" = "🟢 DEV"
+
+# Test
+"test-cluster" = "🔵 TEST"
+"test" = "🔵 TEST"
+
+# Detekcja kontekstu (kiedy wyświetlać)
+[kubernetes.detect_extensions]
+[kubernetes.detect_files]
+[kubernetes.detect_folders]
+
+# Katalog
+[directory]
+truncation_length = 3
+truncate_to_repo = true
+style = "bold cyan"
+
+# Git
+[git_branch]
+format = "[$symbol$branch]($style) "
+style = "bold purple"
+
+[git_status]
+format = '([\[$all_status$ahead_behind\]]($style) )'
+style = "bold red"
+
+# Czas wykonania komendy
+[cmd_duration]
+min_time = 2000
+format = "took [$duration]($style) "
+style = "bold yellow"
+
+# Username (pokaż tylko dla root lub SSH)
+[username]
+show_always = false
+style_user = "bold green"
+style_root = "bold red"
+format = "[$user]($style)@"
+
+# Hostname (pokaż tylko dla SSH)
+[hostname]
+ssh_only = true
+format = "[$hostname]($style):"
+style = "bold green"
+
+# Znak zachęty
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"

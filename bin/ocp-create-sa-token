@@ -1,0 +1,165 @@
+#!/bin/bash
+#
+# ocp-create-sa-token - Tworzenie Service Account z nie wygasającym tokenem
+# Użycie: ocp-create-sa-token [nazwa-sa] [namespace]
+#
+# Ten skrypt tworzy ServiceAccount z uprawnieniami cluster-admin
+# i generuje długotrwały token (nie wygasający automatycznie)
+#
+
+# Kolory
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+SA_NAME="${1:-ocp-admin-sa}"
+NAMESPACE="${2:-openshift-config}"
+SECRET_NAME="${SA_NAME}-token"
+
+show_help() {
+    echo "Tworzenie ServiceAccount z nie wygasającym tokenem"
+    echo ""
+    echo "Użycie: ocp-create-sa-token [nazwa-sa] [namespace]"
+    echo ""
+    echo "Domyślne wartości:"
+    echo "  nazwa-sa:  ocp-admin-sa"
+    echo "  namespace: openshift-config"
+    echo ""
+    echo "Przykłady:"
+    echo "  ocp-create-sa-token"
+    echo "  ocp-create-sa-token my-admin-sa kube-system"
+    echo ""
+    echo "UWAGA: Wymaga uprawnień cluster-admin"
+}
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_help
+    exit 0
+fi
+
+echo -e "${BLUE}=== Tworzenie ServiceAccount z nie wygasającym tokenem ===${NC}"
+echo ""
+echo "ServiceAccount: $SA_NAME"
+echo "Namespace:      $NAMESPACE"
+echo ""
+
+# Sprawdź czy mamy połączenie z klastrem
+if ! oc whoami &>/dev/null; then
+    echo -e "${RED}Błąd: Nie jesteś zalogowany do klastra${NC}"
+    echo "Użyj najpierw: oc login"
+    exit 1
+fi
+
+CLUSTER_API=$(oc whoami --show-server)
+echo -e "Klaster: ${GREEN}$CLUSTER_API${NC}"
+echo ""
+
+# Sprawdź wersję OpenShift
+OCP_VERSION=$(oc version -o json 2>/dev/null | grep -o '"openshiftVersion": "[^"]*"' | cut -d'"' -f4)
+echo "Wersja OpenShift: $OCP_VERSION"
+echo ""
+
+# 1. Utwórz namespace jeśli nie istnieje
+echo -e "${BLUE}[1/5] Sprawdzanie namespace...${NC}"
+if ! oc get namespace "$NAMESPACE" &>/dev/null; then
+    echo "Tworzenie namespace $NAMESPACE..."
+    oc create namespace "$NAMESPACE"
+fi
+
+# 2. Utwórz ServiceAccount
+echo -e "${BLUE}[2/5] Tworzenie ServiceAccount...${NC}"
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${SA_NAME}
+  namespace: ${NAMESPACE}
+EOF
+
+# 3. Nadaj uprawnienia cluster-admin
+echo -e "${BLUE}[3/5] Nadawanie uprawnień cluster-admin...${NC}"
+cat <<EOF | oc apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${SA_NAME}-cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: ${SA_NAME}
+  namespace: ${NAMESPACE}
+EOF
+
+# 4. Utwórz Secret z tokenem (dla OCP 4.11+)
+echo -e "${BLUE}[4/5] Tworzenie Secret z tokenem...${NC}"
+
+# W OpenShift 4.11+ tokeny nie są automatycznie tworzone
+# Trzeba stworzyć Secret typu kubernetes.io/service-account-token
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_NAME}
+  namespace: ${NAMESPACE}
+  annotations:
+    kubernetes.io/service-account.name: ${SA_NAME}
+type: kubernetes.io/service-account-token
+EOF
+
+# Poczekaj na wygenerowanie tokena
+echo "Czekam na wygenerowanie tokena..."
+sleep 3
+
+# 5. Pobierz token
+echo -e "${BLUE}[5/5] Pobieranie tokena...${NC}"
+
+TOKEN=$(oc get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.token}' | base64 -d)
+
+if [[ -z "$TOKEN" ]]; then
+    echo -e "${RED}Błąd: Nie udało się pobrać tokena${NC}"
+    echo ""
+    echo "Sprawdź secret:"
+    echo "  oc describe secret $SECRET_NAME -n $NAMESPACE"
+    exit 1
+fi
+
+echo ""
+echo -e "${GREEN}=== SUKCES ===${NC}"
+echo ""
+echo -e "${YELLOW}Token (zapisz go w bezpiecznym miejscu!):${NC}"
+echo ""
+echo "$TOKEN"
+echo ""
+echo -e "${BLUE}=== Jak używać ===${NC}"
+echo ""
+echo "1. Zapisz token do pliku:"
+echo "   mkdir -p ~/.kube/tokens"
+echo "   echo '$TOKEN' > ~/.kube/tokens/\$(nazwa-klastra)"
+echo "   chmod 600 ~/.kube/tokens/\$(nazwa-klastra)"
+echo ""
+echo "2. Zaloguj się używając tokena:"
+echo "   oc login $CLUSTER_API --token='$TOKEN'"
+echo ""
+echo "3. Lub użyj ocp-login:"
+echo "   ocp-login \$(nazwa-klastra)"
+echo ""
+echo -e "${YELLOW}UWAGA BEZPIECZEŃSTWA:${NC}"
+echo "- Ten token NIE wygasa automatycznie"
+echo "- Przechowuj go bezpiecznie (chmod 600)"
+echo "- W razie kompromitacji usuń secret:"
+echo "  oc delete secret $SECRET_NAME -n $NAMESPACE"
+echo ""
+
+# Opcjonalnie zapisz token do pliku
+read -p "Zapisać token do pliku? (podaj ścieżkę lub zostaw puste): " TOKEN_FILE
+if [[ -n "$TOKEN_FILE" ]]; then
+    mkdir -p "$(dirname "$TOKEN_FILE")"
+    echo "$TOKEN" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    echo -e "${GREEN}Token zapisany do: $TOKEN_FILE${NC}"
+fi

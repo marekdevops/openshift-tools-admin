@@ -1,0 +1,186 @@
+#!/bin/bash
+#
+# ocp-activate - Aktywacja środowiska OpenShift (styl venv)
+#
+# Użycie: source ocp-activate [klaster]
+#         source ocp-activate           # aktywuj bez wyboru klastra
+#         source ocp-activate prod1     # aktywuj i przełącz na prod1
+#
+# Dezaktywacja: ocp-deactivate
+#
+
+# Sprawdź czy skrypt jest source'owany
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "Ten skrypt musi być uruchomiony przez 'source':"
+    echo "  source ocp-activate"
+    echo "  source ocp-activate [nazwa-klastra]"
+    exit 1
+fi
+
+# Zapisz oryginalne wartości do przywrócenia
+export _OCP_OLD_PS1="${PS1:-}"
+export _OCP_OLD_PATH="${PATH:-}"
+export _OCP_OLD_KUBECONFIG="${KUBECONFIG:-}"
+export _OCP_ACTIVE=1
+
+# ============================================
+# ŚCIEŻKI
+# ============================================
+
+export OCP_TOOLS_DIR="${OCP_TOOLS_DIR:-$HOME/.local/share/openshift-tools}"
+export KUBE_CLUSTERS_DIR="$HOME/.kube/clusters"
+export KUBE_TOKENS_DIR="$HOME/.kube/tokens"
+
+# Dodaj do PATH
+export PATH="$HOME/.local/bin:$OCP_TOOLS_DIR/bin:$PATH"
+
+# ============================================
+# ALIASY
+# ============================================
+
+# Przełączanie klastrów - dostosuj do swoich!
+alias kprod1='export KUBECONFIG=$KUBE_CLUSTERS_DIR/prod-cluster1 && echo "🔴 PRODUKCJA 1"'
+alias kprod2='export KUBECONFIG=$KUBE_CLUSTERS_DIR/prod-cluster2 && echo "🔴 PRODUKCJA 2"'
+alias kstg='export KUBECONFIG=$KUBE_CLUSTERS_DIR/staging-cluster && echo "🟡 STAGING"'
+alias kdev='export KUBECONFIG=$KUBE_CLUSTERS_DIR/dev-cluster && echo "🟢 DEV"'
+alias ktest='export KUBECONFIG=$KUBE_CLUSTERS_DIR/test-cluster && echo "🔵 TEST"'
+alias kreset='unset KUBECONFIG && echo "KUBECONFIG reset"'
+
+# Komendy oc
+alias k='oc'
+alias kgp='oc get pods'
+alias kgs='oc get services'
+alias kgd='oc get deployments'
+alias kgn='oc get nodes'
+alias kgns='oc get projects'
+alias kns='oc project'
+alias kl='oc logs'
+alias klf='oc logs -f'
+alias kexec='oc exec -it'
+alias ka='oc apply -f'
+alias kinfo='echo "=== Cluster ===" && oc whoami --show-server && echo "=== User ===" && oc whoami && echo "=== Project ===" && oc project -q'
+
+# ============================================
+# PROMPT Z KONTEKSTEM KUBERNETES
+# ============================================
+
+__ocp_prompt() {
+    local ctx=""
+    local ns=""
+    local color=""
+
+    if [[ -n "$KUBECONFIG" && -f "$KUBECONFIG" ]]; then
+        ctx=$(basename "$KUBECONFIG" 2>/dev/null)
+        ns=$(oc project -q 2>/dev/null || echo "?")
+
+        # Kolory według typu środowiska
+        case "$ctx" in
+            *prod*)  color="\[\033[0;31m\]" ;;  # czerwony
+            *stag*)  color="\[\033[0;33m\]" ;;  # żółty
+            *dev*)   color="\[\033[0;32m\]" ;;  # zielony
+            *test*)  color="\[\033[0;34m\]" ;;  # niebieski
+            *)       color="\[\033[0;35m\]" ;;  # fioletowy
+        esac
+
+        echo "${color}[${ctx}/${ns}]\[\033[0m\] "
+    else
+        echo "\[\033[0;36m\](ocp)\[\033[0m\] "
+    fi
+}
+
+# Ustaw nowy prompt
+PS1="\$(__ocp_prompt)${_OCP_OLD_PS1}"
+
+# ============================================
+# FUNKCJA DEZAKTYWACJI
+# ============================================
+
+ocp-deactivate() {
+    # Przywróć oryginalne wartości
+    if [[ -n "$_OCP_OLD_PS1" ]]; then
+        PS1="$_OCP_OLD_PS1"
+    fi
+
+    if [[ -n "$_OCP_OLD_PATH" ]]; then
+        PATH="$_OCP_OLD_PATH"
+    fi
+
+    if [[ -n "$_OCP_OLD_KUBECONFIG" ]]; then
+        KUBECONFIG="$_OCP_OLD_KUBECONFIG"
+    else
+        unset KUBECONFIG
+    fi
+
+    # Usuń aliasy
+    unalias kprod1 kprod2 kstg kdev ktest kreset 2>/dev/null
+    unalias k kgp kgs kgd kgn kgns kns kl klf kexec ka kinfo 2>/dev/null
+
+    # Wyczyść zmienne
+    unset _OCP_OLD_PS1 _OCP_OLD_PATH _OCP_OLD_KUBECONFIG _OCP_ACTIVE
+    unset OCP_TOOLS_DIR KUBE_CLUSTERS_DIR KUBE_TOKENS_DIR
+    unset -f ocp-deactivate __ocp_prompt ocp-current ocp-list ocp 2>/dev/null
+
+    echo "Środowisko OCP dezaktywowane"
+}
+
+# ============================================
+# FUNKCJE POMOCNICZE
+# ============================================
+
+ocp-current() {
+    if [[ -z "$KUBECONFIG" ]]; then
+        echo "Brak aktywnego klastra (KUBECONFIG nie ustawiony)"
+        return 1
+    fi
+    echo "Klaster:  $(basename "$KUBECONFIG")"
+    echo "User:     $(oc whoami 2>/dev/null || echo 'nie połączony')"
+    echo "Project:  $(oc project -q 2>/dev/null || echo 'brak')"
+    echo "API:      $(oc whoami --show-server 2>/dev/null || echo 'nieznany')"
+}
+
+ocp-list() {
+    echo "Dostępne klastry:"
+    ls -1 "$KUBE_CLUSTERS_DIR" 2>/dev/null || echo "  (brak)"
+    echo ""
+    echo "Aktualny: $(basename "${KUBECONFIG:-brak}" 2>/dev/null)"
+}
+
+ocp() {
+    if [[ -z "$1" ]]; then
+        ocp-list
+    else
+        local cluster_file="$KUBE_CLUSTERS_DIR/$1"
+        if [[ -f "$cluster_file" ]]; then
+            export KUBECONFIG="$cluster_file"
+            echo "Przełączono na: $1"
+
+            # Ostrzeżenie dla produkcji
+            if [[ "$1" == *prod* ]]; then
+                echo -e "\033[0;31m⚠️  UWAGA: Środowisko PRODUKCYJNE!\033[0m"
+            fi
+        else
+            echo "Klaster '$1' nie istnieje"
+            ocp-list
+        fi
+    fi
+}
+
+# ============================================
+# KOMUNIKAT AKTYWACJI
+# ============================================
+
+echo ""
+echo -e "\033[0;32m✓ Środowisko OpenShift aktywowane\033[0m"
+echo ""
+echo "Komendy:"
+echo "  ocp [klaster]    - przełącz klaster (lub lista)"
+echo "  ocp-current      - pokaż aktualny kontekst"
+echo "  ocp-deactivate   - dezaktywuj środowisko"
+echo ""
+echo "Aliasy: kprod1, kprod2, kstg, kdev, ktest"
+echo ""
+
+# Jeśli podano argument, przełącz na klaster
+if [[ -n "$1" ]]; then
+    ocp "$1"
+fi

@@ -7,6 +7,7 @@ Kompletny zestaw narzędzi do zarządzania wieloma klastrami OpenShift.
 ```
 openshift-tools/
 ├── bin/                          # Skrypty
+│   ├── ocp-activate              # Aktywacja środowiska (styl venv)
 │   ├── ocp-switch                # Przełączanie między klastrami
 │   ├── ocp-login                 # Logowanie do klastrów
 │   ├── ocp-create-sa-token       # Tworzenie ServiceAccount z tokenem
@@ -63,6 +64,28 @@ ls -la ~/.local/bin/
 
 ### 1.3 Skonfiguruj shell
 
+**OPCJA A: Aktywacja na żądanie (styl Python venv) - ZALECANE**
+
+Dodaj tylko ścieżkę do `~/.bashrc`:
+
+```bash
+# OpenShift Tools - tylko PATH
+export PATH="$HOME/.local/bin:$HOME/.local/share/openshift-tools/bin:$PATH"
+```
+
+Środowisko aktywujesz gdy potrzebujesz:
+
+```bash
+source ocp-activate           # aktywuj środowisko
+source ocp-activate prod1     # aktywuj i przełącz na klaster
+
+# Praca z OpenShift...
+
+ocp-deactivate                # dezaktywuj gdy skończysz
+```
+
+**OPCJA B: Automatyczna aktywacja przy logowaniu**
+
 Dodaj do `~/.bashrc` (lub `~/.zshrc`):
 
 ```bash
@@ -74,7 +97,7 @@ export PATH="$HOME/.local/bin:$OCP_TOOLS_DIR/bin:$PATH"
 source "$OCP_TOOLS_DIR/config/shell-config.sh"
 ```
 
-### 1.4 Skonfiguruj Starship
+### 1.4 Skonfiguruj Starship (opcjonalne, dla OPCJI B)
 
 ```bash
 # Skopiuj konfigurację

@@ -1,0 +1,39 @@
+#!/bin/bash
+#
+# tmux-ocp-status - Kolorowy status klastra dla tmux statusline
+# Używany przez tmux.conf
+#
+
+# Pobierz nazwę klastra
+if [[ -n "$OCP_CLUSTER" ]]; then
+    CLUSTER="$OCP_CLUSTER"
+elif [[ -n "$KUBECONFIG" ]]; then
+    CLUSTER=$(basename "$KUBECONFIG")
+else
+    echo "#[fg=colour244]☸ ---"
+    exit 0
+fi
+
+# Koloruj według typu środowiska
+case "$CLUSTER" in
+    *prod*)
+        # Czerwony dla produkcji
+        echo "#[fg=colour196,bold]☸ $CLUSTER"
+        ;;
+    *stag*)
+        # Żółty dla staging
+        echo "#[fg=colour214]☸ $CLUSTER"
+        ;;
+    *dev*)
+        # Zielony dla dev
+        echo "#[fg=colour82]☸ $CLUSTER"
+        ;;
+    *test*)
+        # Niebieski dla test
+        echo "#[fg=colour39]☸ $CLUSTER"
+        ;;
+    *)
+        # Domyślny kolor
+        echo "#[fg=colour255]☸ $CLUSTER"
+        ;;
+esac

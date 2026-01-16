@@ -1,0 +1,153 @@
+#!/bin/bash
+#
+# ocp-tmux - Tworzenie sesji tmux z oknami dla klastrów OpenShift
+#
+# Użycie:
+#   ocp-tmux                      # sesja z oknami dla wszystkich klastrów
+#   ocp-tmux prod-cluster1 dev    # sesja tylko z wybranymi klastrami
+#   ocp-tmux -a                   # dołącz do istniejącej sesji
+#
+
+KUBE_CLUSTERS_DIR="${KUBE_CLUSTERS_DIR:-$HOME/.kube/clusters}"
+OCP_TOOLS_DIR="${OCP_TOOLS_DIR:-$HOME/.local/share/openshift-tools}"
+SESSION_NAME="ocp"
+
+# Kolory
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+show_help() {
+    echo "Tworzenie sesji tmux z oknami dla klastrów OpenShift"
+    echo ""
+    echo "Użycie:"
+    echo "  ocp-tmux                        # wszystkie klastry"
+    echo "  ocp-tmux prod-cluster1 dev      # wybrane klastry"
+    echo "  ocp-tmux -a                     # dołącz do sesji"
+    echo "  ocp-tmux -k                     # zamknij sesję"
+    echo "  ocp-tmux -l                     # lista klastrów"
+    echo ""
+    echo "W sesji tmux:"
+    echo "  Ctrl+b n     - następne okno"
+    echo "  Ctrl+b p     - poprzednie okno"
+    echo "  Ctrl+b 0-9   - okno po numerze"
+    echo "  Ctrl+b w     - lista okien"
+    echo "  Ctrl+b d     - odłącz (sesja działa w tle)"
+}
+
+list_clusters() {
+    echo "Dostępne klastry:"
+    ls -1 "$KUBE_CLUSTERS_DIR" 2>/dev/null || echo "  (brak)"
+}
+
+# Sprawdź czy tmux jest zainstalowany
+if ! command -v tmux &> /dev/null; then
+    echo -e "${RED}Błąd: tmux nie jest zainstalowany${NC}"
+    echo "Zainstaluj: sudo dnf install tmux"
+    exit 1
+fi
+
+# Parsowanie argumentów
+case "${1:-}" in
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+    -a|--attach)
+        if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+            tmux attach -t "$SESSION_NAME"
+        else
+            echo -e "${YELLOW}Sesja '$SESSION_NAME' nie istnieje. Tworzę nową...${NC}"
+            exec "$0"
+        fi
+        exit 0
+        ;;
+    -k|--kill)
+        if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+            tmux kill-session -t "$SESSION_NAME"
+            echo -e "${GREEN}Sesja '$SESSION_NAME' zamknięta${NC}"
+        else
+            echo "Sesja '$SESSION_NAME' nie istnieje"
+        fi
+        exit 0
+        ;;
+    -l|--list)
+        list_clusters
+        exit 0
+        ;;
+esac
+
+# Sprawdź czy sesja już istnieje
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo -e "${YELLOW}Sesja '$SESSION_NAME' już istnieje. Dołączam...${NC}"
+    tmux attach -t "$SESSION_NAME"
+    exit 0
+fi
+
+# Pobierz listę klastrów
+if [[ $# -gt 0 ]]; then
+    # Użyj podanych klastrów
+    CLUSTERS=("$@")
+else
+    # Użyj wszystkich klastrów
+    CLUSTERS=($(ls "$KUBE_CLUSTERS_DIR" 2>/dev/null))
+fi
+
+if [[ ${#CLUSTERS[@]} -eq 0 ]]; then
+    echo -e "${RED}Brak klastrów w $KUBE_CLUSTERS_DIR${NC}"
+    echo "Najpierw skonfiguruj klastry używając ocp-login lub ocp-generate-kubeconfig"
+    exit 1
+fi
+
+echo -e "${GREEN}Tworzenie sesji tmux z klastrami:${NC}"
+printf '  %s\n' "${CLUSTERS[@]}"
+echo ""
+
+# Utwórz sesję z pierwszym oknem
+FIRST_CLUSTER="${CLUSTERS[0]}"
+FIRST_KUBECONFIG="$KUBE_CLUSTERS_DIR/$FIRST_CLUSTER"
+
+# Sprawdź czy plik kubeconfig istnieje
+if [[ ! -f "$FIRST_KUBECONFIG" ]]; then
+    echo -e "${RED}Błąd: Klaster '$FIRST_CLUSTER' nie istnieje${NC}"
+    exit 1
+fi
+
+# Utwórz sesję
+tmux new-session -d -s "$SESSION_NAME" -n "$FIRST_CLUSTER" \
+    -e "KUBECONFIG=$FIRST_KUBECONFIG" \
+    -e "OCP_CLUSTER=$FIRST_CLUSTER"
+
+# Wyślij komendy do pierwszego okna
+tmux send-keys -t "$SESSION_NAME:$FIRST_CLUSTER" "export KUBECONFIG='$FIRST_KUBECONFIG'" Enter
+tmux send-keys -t "$SESSION_NAME:$FIRST_CLUSTER" "export OCP_CLUSTER='$FIRST_CLUSTER'" Enter
+tmux send-keys -t "$SESSION_NAME:$FIRST_CLUSTER" "clear && echo '=== $FIRST_CLUSTER ===' && oc whoami 2>/dev/null && oc project 2>/dev/null" Enter
+
+# Dodaj pozostałe okna
+for ((i=1; i<${#CLUSTERS[@]}; i++)); do
+    CLUSTER="${CLUSTERS[$i]}"
+    CLUSTER_KUBECONFIG="$KUBE_CLUSTERS_DIR/$CLUSTER"
+
+    if [[ ! -f "$CLUSTER_KUBECONFIG" ]]; then
+        echo -e "${YELLOW}Pomijam '$CLUSTER' - nie istnieje${NC}"
+        continue
+    fi
+
+    # Utwórz okno
+    tmux new-window -t "$SESSION_NAME" -n "$CLUSTER" \
+        -e "KUBECONFIG=$CLUSTER_KUBECONFIG" \
+        -e "OCP_CLUSTER=$CLUSTER"
+
+    # Wyślij komendy
+    tmux send-keys -t "$SESSION_NAME:$CLUSTER" "export KUBECONFIG='$CLUSTER_KUBECONFIG'" Enter
+    tmux send-keys -t "$SESSION_NAME:$CLUSTER" "export OCP_CLUSTER='$CLUSTER'" Enter
+    tmux send-keys -t "$SESSION_NAME:$CLUSTER" "clear && echo '=== $CLUSTER ===' && oc whoami 2>/dev/null && oc project 2>/dev/null" Enter
+done
+
+# Wróć do pierwszego okna
+tmux select-window -t "$SESSION_NAME:0"
+
+# Dołącz do sesji
+echo -e "${GREEN}Dołączam do sesji...${NC}"
+tmux attach -t "$SESSION_NAME"

@@ -93,8 +93,36 @@ switch_cluster() {
             echo -e "  Projekt:    $(oc project -q 2>/dev/null)"
             echo -e "  API:        $(oc whoami --show-server 2>/dev/null)"
         else
-            echo -e "${YELLOW}Uwaga: Nie można zweryfikować połączenia. Możliwe, że token wygasł.${NC}"
-            echo "Użyj: ocp-login $cluster_name"
+            echo -e "${YELLOW}Token wygasł lub jest nieprawidłowy. Automatyczne logowanie...${NC}"
+            echo ""
+
+            # Sprawdź czy ocp-login jest dostępny
+            local ocp_login_script=""
+            if command -v ocp-login &> /dev/null; then
+                ocp_login_script="ocp-login"
+            elif [[ -f "$(dirname "$0")/ocp-login" ]]; then
+                ocp_login_script="$(dirname "$0")/ocp-login"
+            fi
+
+            if [[ -n "$ocp_login_script" ]]; then
+                "$ocp_login_script" "$cluster_name"
+
+                # Po logowaniu sprawdź ponownie
+                user=$(oc whoami 2>/dev/null)
+                if [[ -n "$user" ]]; then
+                    echo ""
+                    echo -e "${GREEN}Zalogowano pomyślnie!${NC}"
+                    echo -e "  Użytkownik: ${GREEN}$user${NC}"
+                    echo -e "  Projekt:    $(oc project -q 2>/dev/null)"
+                else
+                    echo -e "${RED}Automatyczne logowanie nie powiodło się.${NC}"
+                    echo "Spróbuj ręcznie: ocp-login $cluster_name"
+                    return 1
+                fi
+            else
+                echo -e "${RED}Nie znaleziono ocp-login. Zainstaluj lub dodaj do PATH.${NC}"
+                return 1
+            fi
         fi
     fi
 

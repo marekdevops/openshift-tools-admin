@@ -105,28 +105,128 @@ safe_delete() {
 alias kdelete='safe_delete'
 
 # ============================================
+# WALIDACJA TOKENU
+# ============================================
+
+__check_token_validity() {
+    local kubeconfig_file="$1"
+
+    if [[ ! -f "$kubeconfig_file" ]]; then
+        echo "missing"
+        return
+    fi
+
+    local token=$(grep "token:" "$kubeconfig_file" 2>/dev/null | head -1 | awk '{print $2}')
+
+    if [[ -z "$token" ]]; then
+        echo "no-token"
+        return
+    fi
+
+    # Sprawdź JWT expiration
+    if [[ "$token" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+        local payload=$(echo "$token" | cut -d. -f2 | base64 -d 2>/dev/null)
+        local exp=$(echo "$payload" | grep -o '"exp":[0-9]*' 2>/dev/null | cut -d: -f2)
+
+        if [[ -n "$exp" ]]; then
+            local now=$(date +%s)
+            if [[ $exp -lt $now ]]; then
+                echo "expired"
+                return
+            fi
+        fi
+    fi
+
+    echo "valid"
+}
+
+# ============================================
 # FUNKCJE POMOCNICZE
 # ============================================
 
-# Pokaż aktualny kontekst
+# Pokaż aktualny kontekst z informacją o tokenie
 ocp-current() {
-    echo "KUBECONFIG: ${KUBECONFIG:-nie ustawiony}"
-    if [[ -n "$KUBECONFIG" ]]; then
-        echo "User:       $(oc whoami 2>/dev/null || echo 'nie zalogowany')"
+    if [[ -z "$KUBECONFIG" ]]; then
+        echo -e "\033[0;31mKUBECONFIG: nie ustawiony\033[0m"
+        echo -e "\033[0;33mUWAGA: Komendy oc/kubectl użyją ~/.kube/config!\033[0m"
+        return 1
+    fi
+
+    echo "KUBECONFIG: $KUBECONFIG"
+
+    # Status tokenu
+    local token_status=$(__check_token_validity "$KUBECONFIG")
+    case "$token_status" in
+        valid)    echo -e "Token:      \033[0;32maktywny\033[0m" ;;
+        expired)  echo -e "Token:      \033[0;31mWYGASŁ\033[0m" ;;
+        no-token) echo -e "Token:      \033[0;33mbrak\033[0m" ;;
+        *)        echo -e "Token:      \033[0;90mnieznany\033[0m" ;;
+    esac
+
+    local user=$(oc whoami 2>/dev/null)
+    if [[ -n "$user" ]]; then
+        echo -e "User:       \033[0;32m$user\033[0m"
         echo "Project:    $(oc project -q 2>/dev/null || echo 'brak')"
-        echo "API:        $(oc whoami --show-server 2>/dev/null || echo 'nieznany')"
+        echo "API:        $(oc whoami --show-server 2>/dev/null)"
+    else
+        echo -e "User:       \033[0;31mnie zalogowany\033[0m"
     fi
 }
 
-# Lista wszystkich klastrów
+# Lista wszystkich klastrów ze statusem tokenów
 ocp-list() {
     echo "Dostępne klastry:"
-    ls -1 "$KUBE_CLUSTERS_DIR" 2>/dev/null || echo "Brak skonfigurowanych klastrów"
+
+    if [[ ! -d "$KUBE_CLUSTERS_DIR" ]] || [[ -z "$(ls -A "$KUBE_CLUSTERS_DIR" 2>/dev/null)" ]]; then
+        echo "  (brak skonfigurowanych)"
+        return
+    fi
+
+    for cluster in "$KUBE_CLUSTERS_DIR"/*; do
+        if [[ -f "$cluster" ]]; then
+            local name=$(basename "$cluster")
+            local status=$(__check_token_validity "$cluster")
+            local marker="  "
+            [[ "$KUBECONFIG" == "$cluster" ]] && marker="* "
+
+            case "$status" in
+                valid)    echo -e "${marker}$name  \033[0;32m[OK]\033[0m" ;;
+                expired)  echo -e "${marker}$name  \033[0;31m[WYGASŁ]\033[0m" ;;
+                *)        echo -e "${marker}$name  \033[0;90m[?]\033[0m" ;;
+            esac
+        fi
+    done
+
     echo ""
     echo "Aktualny: ${KUBECONFIG:-brak}"
 }
 
-# Przełącz klaster (wrapper)
+# Sprawdź wszystkie tokeny
+ocp-check() {
+    echo -e "\033[0;34m=== Status tokenów ===\033[0m"
+    echo ""
+
+    if [[ ! -d "$KUBE_CLUSTERS_DIR" ]] || [[ -z "$(ls -A "$KUBE_CLUSTERS_DIR" 2>/dev/null)" ]]; then
+        echo "Brak skonfigurowanych klastrów."
+        return
+    fi
+
+    for cluster in "$KUBE_CLUSTERS_DIR"/*; do
+        if [[ -f "$cluster" ]]; then
+            local name=$(basename "$cluster")
+            local status=$(__check_token_validity "$cluster")
+            local api=$(grep "server:" "$cluster" 2>/dev/null | head -1 | awk '{print $2}')
+
+            case "$status" in
+                valid)   echo -e "\033[0;32m[OK]\033[0m      $name → $api" ;;
+                expired) echo -e "\033[0;31m[WYGASŁ]\033[0m  $name → $api" ;;
+                *)       echo -e "\033[0;90m[?]\033[0m       $name → $api" ;;
+            esac
+        fi
+    done
+}
+
+# Przełącz klaster (wrapper z auto-login)
 ocp() {
     if [[ -z "$1" ]]; then
         ocp-list

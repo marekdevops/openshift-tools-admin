@@ -13,7 +13,103 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+GRAY='\033[0;90m'
 NC='\033[0m' # No Color
+
+# ===========================================
+# WALIDACJA TOKENU
+# ===========================================
+
+# Sprawdź ważność tokenu i zwróć status
+# Zwraca: valid, expired, invalid, unknown
+_check_token_status() {
+    local kubeconfig_file="$1"
+
+    if [[ ! -f "$kubeconfig_file" ]]; then
+        echo "missing"
+        return
+    fi
+
+    # Pobierz token z kubeconfig
+    local token=$(grep "token:" "$kubeconfig_file" 2>/dev/null | head -1 | awk '{print $2}')
+
+    if [[ -z "$token" ]]; then
+        echo "no-token"
+        return
+    fi
+
+    # Sprawdź czy token to JWT (ma 3 części oddzielone kropkami)
+    if [[ "$token" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+        # Dekoduj payload JWT (środkowa część)
+        local payload=$(echo "$token" | cut -d. -f2 | base64 -d 2>/dev/null)
+
+        if [[ -n "$payload" ]]; then
+            # Sprawdź exp (expiration time)
+            local exp=$(echo "$payload" | grep -o '"exp":[0-9]*' | cut -d: -f2)
+
+            if [[ -n "$exp" ]]; then
+                local now=$(date +%s)
+                if [[ $exp -lt $now ]]; then
+                    local expired_ago=$(( (now - exp) / 86400 ))
+                    echo "expired:$expired_ago"
+                    return
+                else
+                    local expires_in=$(( (exp - now) / 86400 ))
+                    echo "valid:$expires_in"
+                    return
+                fi
+            fi
+        fi
+    fi
+
+    # Token nie jest JWT lub nie można sprawdzić - sprawdź przez API
+    local api_url=$(grep "server:" "$kubeconfig_file" 2>/dev/null | head -1 | awk '{print $2}')
+
+    if [[ -n "$api_url" ]]; then
+        local http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $token" \
+            "$api_url/apis" 2>/dev/null)
+
+        case "$http_code" in
+            200|201) echo "valid:sa" ;;      # Service Account token (nie wygasa)
+            401|403) echo "expired:api" ;;
+            000)     echo "unreachable" ;;
+            *)       echo "unknown:$http_code" ;;
+        esac
+    else
+        echo "no-api"
+    fi
+}
+
+# Formatuj status tokenu do wyświetlenia
+_format_token_status() {
+    local status="$1"
+    local type="${status%%:*}"
+    local detail="${status#*:}"
+
+    case "$type" in
+        valid)
+            if [[ "$detail" == "sa" ]]; then
+                echo -e "${GREEN}aktywny${NC} ${GRAY}(SA - nie wygasa)${NC}"
+            else
+                echo -e "${GREEN}aktywny${NC} ${GRAY}(wygasa za ${detail}d)${NC}"
+            fi
+            ;;
+        expired)
+            if [[ "$detail" == "api" ]]; then
+                echo -e "${RED}wygasł${NC}"
+            else
+                echo -e "${RED}wygasł${NC} ${GRAY}(${detail}d temu)${NC}"
+            fi
+            ;;
+        missing)    echo -e "${RED}brak pliku kubeconfig${NC}" ;;
+        no-token)   echo -e "${YELLOW}brak tokenu w kubeconfig${NC}" ;;
+        no-api)     echo -e "${YELLOW}brak API URL${NC}" ;;
+        unreachable) echo -e "${YELLOW}API niedostępne${NC}" ;;
+        *)          echo -e "${GRAY}nieznany${NC}" ;;
+    esac
+}
 
 show_help() {
     echo "Użycie: ocp-switch [OPCJE] [nazwa-klastra]"
@@ -33,26 +129,44 @@ list_clusters() {
     echo -e "${BLUE}Dostępne klastry:${NC}"
     echo ""
 
+    # Sprawdź czy katalog istnieje i ma pliki
+    if [[ ! -d "$KUBE_DIR" ]] || [[ -z "$(ls -A "$KUBE_DIR" 2>/dev/null)" ]]; then
+        echo -e "  ${YELLOW}Brak skonfigurowanych klastrów${NC}"
+        echo ""
+        echo "Użyj: ocp-login --add  lub  ocp-generate-kubeconfig"
+        return
+    fi
+
     for cluster in "$KUBE_DIR"/*; do
         if [[ -f "$cluster" ]]; then
             name=$(basename "$cluster")
+            token_status=$(_check_token_status "$cluster")
+            formatted_status=$(_format_token_status "$token_status")
 
             # Sprawdź czy to aktualny kontekst
             if [[ "$KUBECONFIG" == "$cluster" ]]; then
-                echo -e "  ${GREEN}* $name${NC} (aktywny)"
+                echo -e "  ${GREEN}*${NC} $name  $formatted_status"
             else
-                echo "    $name"
+                echo -e "    $name  $formatted_status"
             fi
         fi
     done
 
     echo ""
     echo -e "${YELLOW}Aktualny KUBECONFIG:${NC} ${KUBECONFIG:-nie ustawiony}"
+
+    # Ostrzeżenie jeśli KUBECONFIG nie jest ustawiony
+    if [[ -z "$KUBECONFIG" ]]; then
+        echo -e "${RED}UWAGA: KUBECONFIG nie jest ustawiony - oc użyje ~/.kube/config!${NC}"
+    fi
 }
 
 show_current() {
     if [[ -z "$KUBECONFIG" ]]; then
-        echo -e "${YELLOW}KUBECONFIG nie jest ustawiony${NC}"
+        echo -e "${RED}KUBECONFIG nie jest ustawiony${NC}"
+        echo -e "${YELLOW}UWAGA: Komendy oc/kubectl użyją domyślnego ~/.kube/config!${NC}"
+        echo ""
+        echo "Ustaw klaster: source ocp-switch [nazwa]"
         return 1
     fi
 
@@ -60,10 +174,24 @@ show_current() {
     echo -e "  KUBECONFIG: $KUBECONFIG"
     echo ""
 
+    # Status tokenu
+    local token_status=$(_check_token_status "$KUBECONFIG")
+    local formatted_status=$(_format_token_status "$token_status")
+    echo -e "  Token:      $formatted_status"
+
     if command -v oc &> /dev/null; then
-        echo -e "  Użytkownik: $(oc whoami 2>/dev/null || echo 'nie zalogowany')"
-        echo -e "  Projekt:    $(oc project -q 2>/dev/null || echo 'brak')"
-        echo -e "  API:        $(oc whoami --show-server 2>/dev/null || echo 'nieznany')"
+        local user=$(oc whoami 2>/dev/null)
+        if [[ -n "$user" ]]; then
+            echo -e "  Użytkownik: ${GREEN}$user${NC}"
+            echo -e "  Projekt:    $(oc project -q 2>/dev/null || echo 'brak')"
+            echo -e "  API:        $(oc whoami --show-server 2>/dev/null)"
+        else
+            echo -e "  Użytkownik: ${RED}nie zalogowany (token wygasł?)${NC}"
+
+            # Pokaż zapisany API URL z kubeconfig
+            local api=$(grep "server:" "$KUBECONFIG" 2>/dev/null | head -1 | awk '{print $2}')
+            echo -e "  API:        ${YELLOW}$api${NC} (z kubeconfig)"
+        fi
     fi
 }
 
@@ -78,50 +206,64 @@ switch_cluster() {
         return 1
     fi
 
+    # Sprawdź status tokenu PRZED przełączeniem
+    local token_status=$(_check_token_status "$cluster_file")
+    local token_type="${token_status%%:*}"
+
     # Eksportuj KUBECONFIG
     export KUBECONFIG="$cluster_file"
 
     # Wyświetl informację
     echo -e "${GREEN}Przełączono na klaster: $cluster_name${NC}"
+
+    # Status tokenu
+    local formatted_status=$(_format_token_status "$token_status")
+    echo -e "  Token: $formatted_status"
     echo ""
 
-    # Sprawdź połączenie
-    if command -v oc &> /dev/null; then
-        local user=$(oc whoami 2>/dev/null)
-        if [[ -n "$user" ]]; then
-            echo -e "  Użytkownik: ${GREEN}$user${NC}"
-            echo -e "  Projekt:    $(oc project -q 2>/dev/null)"
-            echo -e "  API:        $(oc whoami --show-server 2>/dev/null)"
-        else
-            echo -e "${YELLOW}Token wygasł lub jest nieprawidłowy. Automatyczne logowanie...${NC}"
-            echo ""
+    # Jeśli token wygasł, od razu próbuj auto-login
+    if [[ "$token_type" == "expired" || "$token_type" == "no-token" ]]; then
+        echo -e "${YELLOW}Token wygasł lub jest nieprawidłowy. Automatyczne logowanie...${NC}"
+        echo ""
 
-            # Sprawdź czy ocp-login jest dostępny
-            local ocp_login_script=""
-            if command -v ocp-login &> /dev/null; then
-                ocp_login_script="ocp-login"
-            elif [[ -f "$(dirname "$0")/ocp-login" ]]; then
-                ocp_login_script="$(dirname "$0")/ocp-login"
-            fi
+        # Sprawdź czy ocp-login jest dostępny
+        local ocp_login_script=""
+        if command -v ocp-login &> /dev/null; then
+            ocp_login_script="ocp-login"
+        elif [[ -f "$(dirname "$0")/ocp-login" ]]; then
+            ocp_login_script="$(dirname "$0")/ocp-login"
+        fi
 
-            if [[ -n "$ocp_login_script" ]]; then
-                "$ocp_login_script" "$cluster_name"
+        if [[ -n "$ocp_login_script" ]]; then
+            "$ocp_login_script" "$cluster_name"
 
-                # Po logowaniu sprawdź ponownie
-                user=$(oc whoami 2>/dev/null)
-                if [[ -n "$user" ]]; then
-                    echo ""
-                    echo -e "${GREEN}Zalogowano pomyślnie!${NC}"
-                    echo -e "  Użytkownik: ${GREEN}$user${NC}"
-                    echo -e "  Projekt:    $(oc project -q 2>/dev/null)"
-                else
-                    echo -e "${RED}Automatyczne logowanie nie powiodło się.${NC}"
-                    echo "Spróbuj ręcznie: ocp-login $cluster_name"
-                    return 1
-                fi
+            # Po logowaniu sprawdź ponownie
+            local user=$(oc whoami 2>/dev/null)
+            if [[ -n "$user" ]]; then
+                echo ""
+                echo -e "${GREEN}Zalogowano pomyślnie!${NC}"
+                echo -e "  Użytkownik: ${GREEN}$user${NC}"
+                echo -e "  Projekt:    $(oc project -q 2>/dev/null)"
             else
-                echo -e "${RED}Nie znaleziono ocp-login. Zainstaluj lub dodaj do PATH.${NC}"
+                echo -e "${RED}Automatyczne logowanie nie powiodło się.${NC}"
+                echo "Spróbuj ręcznie: ocp-login $cluster_name"
                 return 1
+            fi
+        else
+            echo -e "${RED}Nie znaleziono ocp-login. Zainstaluj lub dodaj do PATH.${NC}"
+            return 1
+        fi
+    else
+        # Token OK - pokaż info
+        if command -v oc &> /dev/null; then
+            local user=$(oc whoami 2>/dev/null)
+            if [[ -n "$user" ]]; then
+                echo -e "  Użytkownik: ${GREEN}$user${NC}"
+                echo -e "  Projekt:    $(oc project -q 2>/dev/null)"
+                echo -e "  API:        $(oc whoami --show-server 2>/dev/null)"
+            else
+                # Token wygląda OK ale oc whoami nie działa - może problem sieciowy
+                echo -e "${YELLOW}Nie można zweryfikować połączenia (sieć?)${NC}"
             fi
         fi
     fi

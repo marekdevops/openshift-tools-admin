@@ -119,9 +119,45 @@ ocp-deactivate() {
     # Wyczyść zmienne
     unset _OCP_OLD_PS1 _OCP_OLD_PATH _OCP_OLD_KUBECONFIG _OCP_ACTIVE
     unset OCP_TOOLS_DIR KUBE_CLUSTERS_DIR KUBE_TOKENS_DIR
-    unset -f ocp-deactivate __ocp_prompt ocp-current ocp-list ocp 2>/dev/null
+    unset -f ocp-deactivate __ocp_prompt ocp-current ocp-list ocp ocp-check __check_token_validity 2>/dev/null
 
     echo "Środowisko OCP dezaktywowane"
+}
+
+# ============================================
+# WALIDACJA TOKENU (uproszczona dla funkcji)
+# ============================================
+
+__check_token_validity() {
+    local kubeconfig_file="$1"
+
+    if [[ ! -f "$kubeconfig_file" ]]; then
+        echo "missing"
+        return
+    fi
+
+    local token=$(grep "token:" "$kubeconfig_file" 2>/dev/null | head -1 | awk '{print $2}')
+
+    if [[ -z "$token" ]]; then
+        echo "no-token"
+        return
+    fi
+
+    # Sprawdź JWT expiration
+    if [[ "$token" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+        local payload=$(echo "$token" | cut -d. -f2 | base64 -d 2>/dev/null)
+        local exp=$(echo "$payload" | grep -o '"exp":[0-9]*' 2>/dev/null | cut -d: -f2)
+
+        if [[ -n "$exp" ]]; then
+            local now=$(date +%s)
+            if [[ $exp -lt $now ]]; then
+                echo "expired"
+                return
+            fi
+        fi
+    fi
+
+    echo "valid"
 }
 
 # ============================================
@@ -130,18 +166,63 @@ ocp-deactivate() {
 
 ocp-current() {
     if [[ -z "$KUBECONFIG" ]]; then
-        echo "Brak aktywnego klastra (KUBECONFIG nie ustawiony)"
+        echo -e "\033[0;31mBrak aktywnego klastra (KUBECONFIG nie ustawiony)\033[0m"
+        echo -e "\033[0;33mUWAGA: Komendy oc/kubectl użyją ~/.kube/config!\033[0m"
         return 1
     fi
-    echo "Klaster:  $(basename "$KUBECONFIG")"
-    echo "User:     $(oc whoami 2>/dev/null || echo 'nie połączony')"
-    echo "Project:  $(oc project -q 2>/dev/null || echo 'brak')"
-    echo "API:      $(oc whoami --show-server 2>/dev/null || echo 'nieznany')"
+
+    local cluster_name=$(basename "$KUBECONFIG")
+    local token_status=$(__check_token_validity "$KUBECONFIG")
+
+    echo "Klaster:  $cluster_name"
+
+    # Status tokenu
+    case "$token_status" in
+        valid)    echo -e "Token:    \033[0;32maktywny\033[0m" ;;
+        expired)  echo -e "Token:    \033[0;31mWYGASŁ\033[0m - użyj: ocp-login $cluster_name" ;;
+        no-token) echo -e "Token:    \033[0;33mbrak tokenu\033[0m" ;;
+        missing)  echo -e "Token:    \033[0;31mbrak pliku\033[0m" ;;
+        *)        echo -e "Token:    \033[0;90mnieznany\033[0m" ;;
+    esac
+
+    local user=$(oc whoami 2>/dev/null)
+    if [[ -n "$user" ]]; then
+        echo -e "User:     \033[0;32m$user\033[0m"
+        echo "Project:  $(oc project -q 2>/dev/null || echo 'brak')"
+        echo "API:      $(oc whoami --show-server 2>/dev/null)"
+    else
+        echo -e "User:     \033[0;31mnie połączony\033[0m"
+        local api=$(grep "server:" "$KUBECONFIG" 2>/dev/null | head -1 | awk '{print $2}')
+        echo "API:      $api (z kubeconfig)"
+    fi
 }
 
 ocp-list() {
     echo "Dostępne klastry:"
-    ls -1 "$KUBE_CLUSTERS_DIR" 2>/dev/null || echo "  (brak)"
+
+    if [[ ! -d "$KUBE_CLUSTERS_DIR" ]] || [[ -z "$(ls -A "$KUBE_CLUSTERS_DIR" 2>/dev/null)" ]]; then
+        echo "  (brak skonfigurowanych)"
+        echo ""
+        echo "Dodaj klaster: ocp-login --add"
+        return
+    fi
+
+    for cluster in "$KUBE_CLUSTERS_DIR"/*; do
+        if [[ -f "$cluster" ]]; then
+            local name=$(basename "$cluster")
+            local status=$(__check_token_validity "$cluster")
+
+            local marker="  "
+            [[ "$KUBECONFIG" == "$cluster" ]] && marker="* "
+
+            case "$status" in
+                valid)    echo -e "${marker}$name  \033[0;32m[OK]\033[0m" ;;
+                expired)  echo -e "${marker}$name  \033[0;31m[WYGASŁ]\033[0m" ;;
+                *)        echo -e "${marker}$name  \033[0;90m[?]\033[0m" ;;
+            esac
+        fi
+    done
+
     echo ""
     echo "Aktualny: $(basename "${KUBECONFIG:-brak}" 2>/dev/null)"
 }
@@ -149,20 +230,105 @@ ocp-list() {
 ocp() {
     if [[ -z "$1" ]]; then
         ocp-list
-    else
-        local cluster_file="$KUBE_CLUSTERS_DIR/$1"
-        if [[ -f "$cluster_file" ]]; then
-            export KUBECONFIG="$cluster_file"
-            echo "Przełączono na: $1"
+        return
+    fi
 
-            # Ostrzeżenie dla produkcji
-            if [[ "$1" == *prod* ]]; then
-                echo -e "\033[0;31m⚠️  UWAGA: Środowisko PRODUKCYJNE!\033[0m"
-            fi
+    local cluster_name="$1"
+    local cluster_file="$KUBE_CLUSTERS_DIR/$cluster_name"
+
+    if [[ ! -f "$cluster_file" ]]; then
+        echo -e "\033[0;31mKlaster '$cluster_name' nie istnieje\033[0m"
+        ocp-list
+        return 1
+    fi
+
+    # Sprawdź status tokenu PRZED przełączeniem
+    local token_status=$(__check_token_validity "$cluster_file")
+
+    export KUBECONFIG="$cluster_file"
+    echo -e "\033[0;32mPrzełączono na: $cluster_name\033[0m"
+
+    # Jeśli token wygasł - uruchom auto-login przez ocp-switch
+    if [[ "$token_status" == "expired" || "$token_status" == "no-token" ]]; then
+        echo -e "\033[0;33mToken wygasł - próba automatycznego logowania...\033[0m"
+
+        if command -v ocp-login &> /dev/null; then
+            ocp-login "$cluster_name"
+        elif [[ -f "$OCP_TOOLS_DIR/bin/ocp-login" ]]; then
+            "$OCP_TOOLS_DIR/bin/ocp-login" "$cluster_name"
         else
-            echo "Klaster '$1' nie istnieje"
-            ocp-list
+            echo -e "\033[0;31mNie znaleziono ocp-login. Zaloguj się ręcznie.\033[0m"
+            return 1
         fi
+    else
+        # Token OK - pokaż info
+        local user=$(oc whoami 2>/dev/null)
+        if [[ -n "$user" ]]; then
+            echo -e "  User: \033[0;32m$user\033[0m"
+        fi
+    fi
+
+    # Ostrzeżenie dla produkcji
+    if [[ "$cluster_name" == *prod* ]]; then
+        echo -e "\033[0;31m⚠️  UWAGA: Środowisko PRODUKCYJNE!\033[0m"
+    fi
+}
+
+# ============================================
+# FUNKCJA SPRAWDZANIA WSZYSTKICH TOKENÓW
+# ============================================
+
+ocp-check() {
+    echo -e "\033[0;34m=== Status tokenów dla wszystkich klastrów ===\033[0m"
+    echo ""
+
+    if [[ ! -d "$KUBE_CLUSTERS_DIR" ]] || [[ -z "$(ls -A "$KUBE_CLUSTERS_DIR" 2>/dev/null)" ]]; then
+        echo "Brak skonfigurowanych klastrów."
+        return
+    fi
+
+    local expired_count=0
+    local valid_count=0
+
+    for cluster in "$KUBE_CLUSTERS_DIR"/*; do
+        if [[ -f "$cluster" ]]; then
+            local name=$(basename "$cluster")
+            local status=$(__check_token_validity "$cluster")
+            local api=$(grep "server:" "$cluster" 2>/dev/null | head -1 | awk '{print $2}')
+
+            case "$status" in
+                valid)
+                    echo -e "\033[0;32m[OK]\033[0m      $name"
+                    echo -e "          API: $api"
+                    ((valid_count++))
+                    ;;
+                expired)
+                    echo -e "\033[0;31m[WYGASŁ]\033[0m  $name"
+                    echo -e "          API: $api"
+                    echo -e "          \033[0;33m→ Użyj: ocp-login $name\033[0m"
+                    ((expired_count++))
+                    ;;
+                no-token)
+                    echo -e "\033[0;33m[BRAK]\033[0m    $name"
+                    echo -e "          API: $api"
+                    echo -e "          \033[0;33m→ Brak tokenu w kubeconfig\033[0m"
+                    ((expired_count++))
+                    ;;
+                *)
+                    echo -e "\033[0;90m[?]\033[0m       $name"
+                    echo -e "          API: $api"
+                    ;;
+            esac
+            echo ""
+        fi
+    done
+
+    echo "---"
+    echo -e "Podsumowanie: \033[0;32m$valid_count OK\033[0m, \033[0;31m$expired_count wymaga uwagi\033[0m"
+
+    if [[ $expired_count -gt 0 ]]; then
+        echo ""
+        echo -e "\033[0;33mWskazówka: Aby odnowić tokeny, użyj ocp-login [nazwa-klastra]\033[0m"
     fi
 }
 
@@ -176,9 +342,18 @@ echo ""
 echo "Komendy:"
 echo "  ocp [klaster]    - przełącz klaster (lub lista)"
 echo "  ocp-current      - pokaż aktualny kontekst"
+echo "  ocp-check        - sprawdź ważność wszystkich tokenów"
 echo "  ocp-deactivate   - dezaktywuj środowisko"
 echo ""
 echo "Aliasy: kprod1, kprod2, kstg, kdev, ktest"
+
+# Ostrzeżenie o domyślnym KUBECONFIG
+if [[ -n "$_OCP_OLD_KUBECONFIG" && "$_OCP_OLD_KUBECONFIG" == "$HOME/.kube/config" ]]; then
+    echo ""
+    echo -e "\033[0;33m⚠ Poprzednio używałeś domyślnego ~/.kube/config\033[0m"
+    echo -e "  Zalecane: użyj dedykowanych plików z ~/.kube/clusters/"
+fi
+
 echo ""
 
 # Jeśli podano argument, przełącz na klaster

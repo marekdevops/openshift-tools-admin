@@ -13,7 +13,57 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
+
+# ===========================================
+# OCHRONA: Blokada domyślnego ~/.kube/config
+# ===========================================
+_protect_default_kubeconfig() {
+    local default_config="$HOME/.kube/config"
+
+    # Jeśli domyślny config nie istnieje lub jest pusty, utwórz "blokadę"
+    if [[ ! -f "$default_config" ]] || [[ ! -s "$default_config" ]]; then
+        mkdir -p "$HOME/.kube"
+        cat > "$default_config" <<'BLOCK'
+# UWAGA: Ten plik jest celowo pusty!
+# Używaj dedykowanych plików kubeconfig z ~/.kube/clusters/
+# NIE loguj się bez --kubeconfig!
+apiVersion: v1
+kind: Config
+preferences: {}
+clusters: null
+contexts: null
+users: null
+current-context: ""
+BLOCK
+        chmod 600 "$default_config"
+    fi
+}
+
+# Walidacja spójności: token vs API URL w istniejącym kubeconfig
+_validate_kubeconfig_consistency() {
+    local cluster_name="$1"
+    local expected_api="$2"
+    local cluster_file="$KUBE_DIR/$cluster_name"
+
+    if [[ -f "$cluster_file" ]]; then
+        local current_api=$(grep -A2 "^clusters:" "$cluster_file" 2>/dev/null | grep "server:" | awk '{print $2}')
+
+        if [[ -n "$current_api" && "$current_api" != "$expected_api" ]]; then
+            echo -e "${RED}OSTRZEŻENIE: Niespójność API URL!${NC}"
+            echo -e "  Zapisany w kubeconfig: ${YELLOW}$current_api${NC}"
+            echo -e "  Oczekiwany z rejestru: ${YELLOW}$expected_api${NC}"
+            echo ""
+            read -p "Czy nadpisać kubeconfig nowym API URL? (t/n): " overwrite
+            if [[ "$overwrite" != "t" ]]; then
+                echo -e "${YELLOW}Anulowano. Sprawdź konfigurację ręcznie.${NC}"
+                return 1
+            fi
+        fi
+    fi
+    return 0
+}
 
 show_help() {
     echo "Użycie: ocp-login [OPCJE] [nazwa-klastra]"
@@ -91,6 +141,9 @@ login_cluster() {
     local cluster_file="$KUBE_DIR/$cluster_name"
     local token_file="$TOKENS_DIR/$cluster_name"
 
+    # Ochrona przed przypadkowym nadpisaniem domyślnego config
+    _protect_default_kubeconfig
+
     load_cluster_config
 
     # Pobierz API URL
@@ -111,11 +164,46 @@ login_cluster() {
         fi
     fi
 
+    # Walidacja spójności istniejącego kubeconfig
+    if ! _validate_kubeconfig_consistency "$cluster_name" "$api_url"; then
+        return 1
+    fi
+
     # Sprawdź czy mamy zapisany token
     local token=""
     if [[ -f "$token_file" ]]; then
         token=$(cat "$token_file")
         echo -e "${BLUE}Używam zapisanego tokena z $token_file${NC}"
+
+        # Walidacja czy token działa z tym API
+        echo -e "${CYAN}Weryfikacja tokena...${NC}"
+        local test_result=$(curl -sk -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $token" \
+            "$api_url/apis" 2>/dev/null)
+
+        if [[ "$test_result" == "401" || "$test_result" == "403" ]]; then
+            echo -e "${YELLOW}Token wygasł lub jest nieprawidłowy dla tego klastra.${NC}"
+            read -p "Podać nowy token? (t/n): " new_token_choice
+            if [[ "$new_token_choice" == "t" ]]; then
+                echo "Podaj token (możesz go uzyskać z: oc whoami -t)"
+                read -sp "Token: " token
+                echo ""
+
+                if [[ -n "$token" ]]; then
+                    echo "$token" > "$token_file"
+                    chmod 600 "$token_file"
+                    echo -e "${GREEN}Nowy token zapisany${NC}"
+                fi
+            else
+                echo -e "${RED}Anulowano - token jest wymagany${NC}"
+                return 1
+            fi
+        elif [[ "$test_result" == "000" ]]; then
+            echo -e "${YELLOW}Nie można połączyć z API ($api_url)${NC}"
+            echo "Sprawdź połączenie sieciowe."
+        else
+            echo -e "${GREEN}Token wygląda na prawidłowy (HTTP $test_result)${NC}"
+        fi
     else
         echo -e "${YELLOW}Brak zapisanego tokena.${NC}"
         echo "Podaj token (możesz go uzyskać z: oc whoami -t)"

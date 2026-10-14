@@ -1,34 +1,72 @@
 #!/bin/bash
 #
-# ocp-login - Skrypt do logowania do klastrów OpenShift
-# Użycie: ocp-login [nazwa-klastra]
+# ocp-login - Logowanie do klastrów OpenShift własnym użytkownikiem (LDAP/AD)
+#
+# Każdy klaster to osobny kubeconfig w ~/.kube/clusters/<nazwa>.
+# Logowanie: oc login -u $OCP_USER (hasło podaje się bezpośrednio do oc).
 #
 
-KUBE_DIR="${KUBE_CLUSTERS_DIR:-$HOME/.kube/clusters}"
-TOKENS_DIR="${KUBE_TOKENS_DIR:-$HOME/.kube/tokens}"
-CLUSTER_CONFIG="$HOME/.kube/cluster-registry.conf"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/ocp-common.sh" || exit 1
 
-# Kolory
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+show_help() {
+    echo "ocp-login - Logowanie do klastrów OpenShift własnym użytkownikiem"
+    echo ""
+    echo "Użycie: ocp-login [OPCJE] [klaster]"
+    echo ""
+    echo "Klastry:"
+    echo "  klaster                  Zaloguj się (zawsze, nawet przy ważnej sesji)"
+    echo "  --ensure klaster         Zaloguj się tylko, jeśli sesja wygasła"
+    echo "  --add klaster API_URL    Dodaj klaster i zaloguj się"
+    echo "  -l, --list               Lista klastrów ze statusem sesji"
+    echo "  -s, --status klaster     Szczegóły sesji klastra"
+    echo "  --logout klaster|--all   Wyloguj (unieważnia token na klastrze)"
+    echo ""
+    echo "Konfiguracja ($OCP_CONFIG_FILE):"
+    echo "  --set-user [login]       Ustaw login LDAP/AD"
+    echo "  --set-ca PLIK|none       Plik z firmowym CA (none = systemowy magazyn)"
+    echo "  --config                 Pokaż konfigurację"
+    echo ""
+    echo "  -h, --help               Pokaż tę pomoc"
+    echo ""
+    echo "Przykłady:"
+    echo "  ocp-login --set-user jan.kowalski"
+    echo "  ocp-login --add prod-cluster1 https://api.prod1.example.com:6443"
+    echo "  ocp-login prod-cluster1"
+}
 
-# ===========================================
-# OCHRONA: Blokada domyślnego ~/.kube/config
-# ===========================================
+_require_cluster() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Podaj nazwę klastra${NC}"
+        return 1
+    fi
+    if ! ocp_valid_name "$name"; then
+        echo -e "${RED}Nieprawidłowa nazwa klastra: '$name'${NC}"
+        return 1
+    fi
+    if [[ ! -f "$(ocp_cluster_file "$name")" ]]; then
+        echo -e "${RED}Klaster '$name' nie istnieje${NC}"
+        echo "Dodaj: ocp-login --add $name https://api.xxx:6443"
+        return 1
+    fi
+}
+
+_prod_warning() {
+    if ocp_is_prod "$1"; then
+        echo -e "${RED}⚠️  UWAGA: Środowisko PRODUKCYJNE!${NC}"
+    fi
+}
+
+# Ochrona: domyślny ~/.kube/config nie powinien zawierać sesji
 _protect_default_kubeconfig() {
     local default_config="$HOME/.kube/config"
 
-    # Jeśli domyślny config nie istnieje lub jest pusty, utwórz "blokadę"
-    if [[ ! -f "$default_config" ]] || [[ ! -s "$default_config" ]]; then
+    if [[ ! -s "$default_config" ]]; then
         mkdir -p "$HOME/.kube"
         cat > "$default_config" <<'BLOCK'
 # UWAGA: Ten plik jest celowo pusty!
-# Używaj dedykowanych plików kubeconfig z ~/.kube/clusters/
-# NIE loguj się bez --kubeconfig!
+# Używaj dedykowanych plików kubeconfig z ~/.kube/clusters/ (source ocp-activate)
 apiVersion: v1
 kind: Config
 preferences: {}
@@ -41,235 +79,222 @@ BLOCK
     fi
 }
 
-# Walidacja spójności: token vs API URL w istniejącym kubeconfig
-_validate_kubeconfig_consistency() {
-    local cluster_name="$1"
-    local expected_api="$2"
-    local cluster_file="$KUBE_DIR/$cluster_name"
+# ============================================
+# KONFIGURACJA
+# ============================================
 
-    if [[ -f "$cluster_file" ]]; then
-        local current_api=$(grep -A2 "^clusters:" "$cluster_file" 2>/dev/null | grep "server:" | awk '{print $2}')
+set_user() {
+    local user="$1"
 
-        if [[ -n "$current_api" && "$current_api" != "$expected_api" ]]; then
-            echo -e "${RED}OSTRZEŻENIE: Niespójność API URL!${NC}"
-            echo -e "  Zapisany w kubeconfig: ${YELLOW}$current_api${NC}"
-            echo -e "  Oczekiwany z rejestru: ${YELLOW}$expected_api${NC}"
-            echo ""
-            read -p "Czy nadpisać kubeconfig nowym API URL? (t/n): " overwrite
-            if [[ "$overwrite" != "t" ]]; then
-                echo -e "${YELLOW}Anulowano. Sprawdź konfigurację ręcznie.${NC}"
-                return 1
-            fi
-        fi
+    if [[ -z "$user" ]]; then
+        read -p "Login LDAP/AD [${OCP_USER:-$USER}]: " user
+        user="${user:-${OCP_USER:-$USER}}"
     fi
-    return 0
-}
 
-show_help() {
-    echo "Użycie: ocp-login [OPCJE] [nazwa-klastra]"
-    echo ""
-    echo "Opcje:"
-    echo "  -a, --add      Dodaj nowy klaster do rejestru"
-    echo "  -l, --list     Pokaż zarejestrowane klastry"
-    echo "  -h, --help     Pokaż tę pomoc"
-    echo ""
-    echo "Przykłady:"
-    echo "  ocp-login prod-cluster1"
-    echo "  ocp-login --add"
-}
-
-# Ładowanie konfiguracji klastrów
-load_cluster_config() {
-    if [[ -f "$CLUSTER_CONFIG" ]]; then
-        source "$CLUSTER_CONFIG"
+    if [[ ! "$user" =~ ^[A-Za-z0-9._@\\-]+$ ]]; then
+        echo -e "${RED}Nieprawidłowy login: '$user'${NC}"
+        return 1
     fi
+
+    ocp_save_config OCP_USER "$user"
+    echo -e "${GREEN}Użytkownik ustawiony: $user${NC}"
 }
 
-# Zapisywanie konfiguracji klastrów
-save_cluster_config() {
-    local name="$1"
-    local api="$2"
+set_ca() {
+    local ca="$1"
 
-    echo "CLUSTER_API_${name//-/_}=\"$api\"" >> "$CLUSTER_CONFIG"
+    if [[ -z "$ca" ]]; then
+        echo -e "${RED}Podaj plik CA lub 'none'${NC}"
+        return 1
+    fi
+
+    if [[ "$ca" == "none" ]]; then
+        ocp_save_config OCP_CA_FILE ""
+        echo -e "${GREEN}Używany będzie systemowy magazyn certyfikatów${NC}"
+        return 0
+    fi
+
+    ca=$(readlink -f "$ca")
+    if [[ ! -f "$ca" ]] || ! grep -q "BEGIN CERTIFICATE" "$ca"; then
+        echo -e "${RED}'$ca' nie jest plikiem PEM z certyfikatem${NC}"
+        return 1
+    fi
+
+    # Zapis jako ~/... - działa po migracji na konto z innym $HOME
+    ocp_save_config OCP_CA_FILE "${ca/#$HOME\//\~/}"
+    echo -e "${GREEN}CA ustawione: $ca${NC}"
+    openssl x509 -in "$ca" -noout -subject -enddate 2>/dev/null | sed 's/^/  /'
 }
 
-# Pobierz API URL dla klastra
-get_cluster_api() {
-    local name="$1"
-    local var_name="CLUSTER_API_${name//-/_}"
-    echo "${!var_name}"
+show_config() {
+    echo -e "${BLUE}Konfiguracja:${NC} $OCP_CONFIG_FILE"
+    echo "  Użytkownik: ${OCP_USER:-(nie ustawiony)}"
+    echo "  CA:         ${OCP_CA_FILE:-systemowy magazyn certyfikatów}"
+    echo "  Klastry:    $KUBE_CLUSTERS_DIR"
 }
 
-# Dodaj nowy klaster
+# ============================================
+# KLASTRY
+# ============================================
+
 add_cluster() {
-    echo -e "${BLUE}Dodawanie nowego klastra${NC}"
-    echo ""
+    local name="$1"
+    local server="${2%/}"
 
-    read -p "Nazwa klastra (np. prod-cluster1): " cluster_name
-    read -p "API URL (np. https://api.cluster.example.com:6443): " cluster_api
-
-    if [[ -z "$cluster_name" || -z "$cluster_api" ]]; then
-        echo -e "${RED}Błąd: Nazwa i API URL są wymagane${NC}"
+    if [[ -z "$name" || -z "$server" ]]; then
+        echo -e "${RED}Użycie: ocp-login --add klaster https://api.xxx:6443${NC}"
+        return 1
+    fi
+    if ! ocp_valid_name "$name"; then
+        echo -e "${RED}Nieprawidłowa nazwa klastra: '$name'${NC}"
+        return 1
+    fi
+    if [[ "$server" != https://* ]]; then
+        echo -e "${RED}API URL musi zaczynać się od https://${NC}"
         return 1
     fi
 
-    save_cluster_config "$cluster_name" "$cluster_api"
-    echo -e "${GREEN}Klaster '$cluster_name' został dodany${NC}"
+    local cluster_file
+    cluster_file=$(ocp_cluster_file "$name")
+    if [[ -f "$cluster_file" ]]; then
+        echo -e "${RED}Klaster '$name' już istnieje${NC} ($(ocp_cluster_server "$cluster_file"))"
+        echo "Zaloguj się: ocp-login $name   lub usuń: ocp-remove --delete $name"
+        return 1
+    fi
+
+    # Szkielet kubeconfig (bez sesji) - zapamiętuje API URL klastra
+    local kc=(--kubeconfig="$cluster_file")
+    oc config set-cluster "$name" --server="$server" "${kc[@]}" >/dev/null &&
+        oc config set-context "$name" --cluster="$name" "${kc[@]}" >/dev/null &&
+        oc config use-context "$name" "${kc[@]}" >/dev/null || return 1
+    chmod 600 "$cluster_file"
+
+    echo -e "${GREEN}Dodano klaster: $name${NC} ($server)"
     echo ""
-    echo "Teraz możesz zalogować się: ocp-login $cluster_name"
+
+    ocp_login_cluster "$name" "$server"
 }
 
-# Lista zarejestrowanych klastrów
 list_clusters() {
-    echo -e "${BLUE}Zarejestrowane klastry:${NC}"
-    echo ""
+    local names
+    names=$(ocp_cluster_names)
 
-    if [[ -f "$CLUSTER_CONFIG" ]]; then
-        grep "^CLUSTER_API_" "$CLUSTER_CONFIG" | while read line; do
-            name=$(echo "$line" | sed 's/CLUSTER_API_//' | cut -d'=' -f1 | tr '_' '-')
-            api=$(echo "$line" | cut -d'=' -f2 | tr -d '"')
-            echo "  $name -> $api"
-        done
-    else
-        echo "  Brak zarejestrowanych klastrów. Użyj: ocp-login --add"
+    echo -e "${BLUE}Klastry${NC} ${GRAY}(użytkownik: ${OCP_USER:-nie ustawiony})${NC}"
+
+    if [[ -z "$names" ]]; then
+        echo "  (brak skonfigurowanych)"
+        echo ""
+        echo "Dodaj: ocp-login --add klaster https://api.xxx:6443"
+        return
     fi
+
+    # Sprawdzenie sesji równolegle - każde zapytanie ma timeout
+    local tmpdir name
+    tmpdir=$(mktemp -d) || return 1
+    for name in $names; do
+        ocp_session_status "$(ocp_cluster_file "$name")" > "$tmpdir/$name" &
+    done
+    wait
+
+    for name in $names; do
+        local marker="  "
+        [[ "$KUBECONFIG" == "$(ocp_cluster_file "$name")" ]] && marker="${GREEN}*${NC} "
+        printf "%b%-24s %b\n" "$marker" "$name" "$(ocp_format_status "$(cat "$tmpdir/$name")")"
+    done
+    rm -rf "$tmpdir"
 }
 
-# Logowanie do klastra
-login_cluster() {
-    local cluster_name="$1"
-    local cluster_file="$KUBE_DIR/$cluster_name"
-    local token_file="$TOKENS_DIR/$cluster_name"
+show_status() {
+    local name="$1"
+    _require_cluster "$name" || return 1
 
-    # Ochrona przed przypadkowym nadpisaniem domyślnego config
-    _protect_default_kubeconfig
+    local cluster_file
+    cluster_file=$(ocp_cluster_file "$name")
+    local status
+    status=$(ocp_session_status "$cluster_file")
 
-    load_cluster_config
-
-    # Pobierz API URL
-    local api_url=$(get_cluster_api "$cluster_name")
-
-    if [[ -z "$api_url" ]]; then
-        echo -e "${YELLOW}Klaster '$cluster_name' nie jest zarejestrowany.${NC}"
-        read -p "Podaj API URL: " api_url
-
-        if [[ -z "$api_url" ]]; then
-            echo -e "${RED}API URL jest wymagany${NC}"
-            return 1
-        fi
-
-        read -p "Zapisać ten klaster? (t/n): " save_choice
-        if [[ "$save_choice" == "t" ]]; then
-            save_cluster_config "$cluster_name" "$api_url"
-        fi
+    echo "Klaster:  $name"
+    echo "API:      $(ocp_cluster_server "$cluster_file")"
+    echo -e "Sesja:    $(ocp_format_status "$status")"
+    if [[ "$status" == ok:* ]]; then
+        echo "Projekt:  $(ocp_cluster_namespace "$cluster_file")"
     fi
-
-    # Walidacja spójności istniejącego kubeconfig
-    if ! _validate_kubeconfig_consistency "$cluster_name" "$api_url"; then
-        return 1
-    fi
-
-    # Sprawdź czy mamy zapisany token
-    local token=""
-    if [[ -f "$token_file" ]]; then
-        token=$(cat "$token_file")
-        echo -e "${BLUE}Używam zapisanego tokena z $token_file${NC}"
-
-        # Walidacja czy token działa z tym API
-        echo -e "${CYAN}Weryfikacja tokena...${NC}"
-        local test_result=$(curl -sk -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $token" \
-            "$api_url/apis" 2>/dev/null)
-
-        if [[ "$test_result" == "401" || "$test_result" == "403" ]]; then
-            echo -e "${YELLOW}Token wygasł lub jest nieprawidłowy dla tego klastra.${NC}"
-            read -p "Podać nowy token? (t/n): " new_token_choice
-            if [[ "$new_token_choice" == "t" ]]; then
-                echo "Podaj token (możesz go uzyskać z: oc whoami -t)"
-                read -sp "Token: " token
-                echo ""
-
-                if [[ -n "$token" ]]; then
-                    echo "$token" > "$token_file"
-                    chmod 600 "$token_file"
-                    echo -e "${GREEN}Nowy token zapisany${NC}"
-                fi
-            else
-                echo -e "${RED}Anulowano - token jest wymagany${NC}"
-                return 1
-            fi
-        elif [[ "$test_result" == "000" ]]; then
-            echo -e "${YELLOW}Nie można połączyć z API ($api_url)${NC}"
-            echo "Sprawdź połączenie sieciowe."
-        else
-            echo -e "${GREEN}Token wygląda na prawidłowy (HTTP $test_result)${NC}"
-        fi
-    else
-        echo -e "${YELLOW}Brak zapisanego tokena.${NC}"
-        echo "Podaj token (możesz go uzyskać z: oc whoami -t)"
-        read -sp "Token: " token
-        echo ""
-
-        if [[ -z "$token" ]]; then
-            echo -e "${RED}Token jest wymagany${NC}"
-            return 1
-        fi
-
-        read -p "Zapisać token do $token_file? (t/n): " save_token
-        if [[ "$save_token" == "t" ]]; then
-            mkdir -p "$TOKENS_DIR"
-            chmod 700 "$TOKENS_DIR"
-            echo "$token" > "$token_file"
-            chmod 600 "$token_file"
-            echo -e "${GREEN}Token zapisany${NC}"
-        fi
-    fi
-
-    # Utwórz katalog na kubeconfig
-    mkdir -p "$KUBE_DIR"
-
-    # Logowanie
-    echo -e "${BLUE}Logowanie do $cluster_name...${NC}"
-
-    oc login "$api_url" \
-        --token="$token" \
-        --kubeconfig="$cluster_file" \
-        --insecure-skip-tls-verify=false
-
-    if [[ $? -eq 0 ]]; then
-        echo ""
-        echo -e "${GREEN}Zalogowano pomyślnie!${NC}"
-        echo ""
-        echo "Aby przełączyć się na ten klaster, użyj:"
-        echo "  source ocp-switch $cluster_name"
-        echo ""
-        echo "Lub dodaj do ~/.bashrc:"
-        echo "  alias k${cluster_name//-/}='export KUBECONFIG=$cluster_file'"
-    else
-        echo -e "${RED}Błąd logowania${NC}"
-        return 1
-    fi
+    _prod_warning "$name"
 }
 
-# Upewnij się, że katalogi istnieją
-mkdir -p "$KUBE_DIR" "$TOKENS_DIR"
-chmod 700 "$TOKENS_DIR"
+# Zaloguj tylko, jeśli nie ma ważnej sesji użytkownika OCP_USER
+ensure_login() {
+    local name="$1"
+    _require_cluster "$name" || return 1
 
-# Parsowanie argumentów
+    local cluster_file
+    cluster_file=$(ocp_cluster_file "$name")
+    local status
+    status=$(ocp_session_status "$cluster_file")
+
+    if ocp_session_is_mine "$status"; then
+        echo -e "  Sesja: $(ocp_format_status "$status")"
+    elif [[ "$status" == "unreachable" ]]; then
+        echo -e "  Sesja: $(ocp_format_status "$status") ${GRAY}- sprawdź sieć/VPN${NC}"
+    else
+        if [[ "$status" == ok:* ]]; then
+            echo -e "${YELLOW}Kubeconfig używa konta ${status#ok:} - loguję jako $OCP_USER${NC}"
+        fi
+        ocp_login_cluster "$name" || return 1
+    fi
+
+    _prod_warning "$name"
+}
+
+logout_clusters() {
+    local names=("$@")
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        echo -e "${RED}Podaj klaster lub --all${NC}"
+        return 1
+    fi
+    if [[ "${names[0]}" == "--all" ]]; then
+        names=($(ocp_cluster_names))
+    fi
+
+    echo -e "${BLUE}Wylogowanie:${NC}"
+    local name rc=0
+    for name in "${names[@]}"; do
+        _require_cluster "$name" || { rc=1; continue; }
+        ocp_logout_cluster "$name"
+    done
+    return $rc
+}
+
+# ============================================
+# GŁÓWNA CZĘŚĆ
+# ============================================
+
+if ! command -v oc &> /dev/null; then
+    echo -e "${RED}Brak polecenia 'oc' w PATH${NC}"
+    exit 1
+fi
+
+mkdir -p "$KUBE_CLUSTERS_DIR"
+chmod 700 "$KUBE_CLUSTERS_DIR"
+_protect_default_kubeconfig
+
 case "${1:-}" in
-    -h|--help)
+    -h|--help|"")  show_help ;;
+    --set-user)    set_user "$2" ;;
+    --set-ca)      set_ca "$2" ;;
+    --config)      show_config ;;
+    --add)         add_cluster "$2" "$3" ;;
+    -l|--list)     list_clusters ;;
+    -s|--status)   show_status "$2" ;;
+    --ensure)      ensure_login "$2" ;;
+    --logout)      shift; logout_clusters "$@" ;;
+    -*)
+        echo -e "${RED}Nieznana opcja: $1${NC}"
         show_help
-        ;;
-    -a|--add)
-        add_cluster
-        ;;
-    -l|--list)
-        list_clusters
-        ;;
-    "")
-        show_help
+        exit 1
         ;;
     *)
-        login_cluster "$1"
+        _require_cluster "$1" && ocp_login_cluster "$1" && _prod_warning "$1"
         ;;
 esac

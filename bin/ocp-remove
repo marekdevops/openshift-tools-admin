@@ -4,25 +4,14 @@
 #
 # Użycie: ocp-remove [OPCJE] klaster [klaster...]
 #
-# Domyślnie klaster jest archiwizowany (można go przywrócić przez --restore):
-# - kubeconfig  → ~/.kube/clusters/.archive/
-# - token       → ~/.kube/tokens/.archive/
-# - wpis z cluster-registry.conf → ~/.kube/clusters/.archive/<klaster>.registry
+# Domyślnie kubeconfig klastra jest przenoszony do ~/.kube/clusters/.archive/
+# i można go przywrócić przez --restore.
 #
 
-KUBE_DIR="${KUBE_CLUSTERS_DIR:-$HOME/.kube/clusters}"
-TOKENS_DIR="${KUBE_TOKENS_DIR:-$HOME/.kube/tokens}"
-CLUSTER_CONFIG="$HOME/.kube/cluster-registry.conf"
-ARCHIVE_DIR="$KUBE_DIR/.archive"
-TOKENS_ARCHIVE_DIR="$TOKENS_DIR/.archive"
-BACKUP_DIR="$HOME/.kube/backup-$(date +%Y%m%d-%H%M%S)"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/ocp-common.sh" || exit 1
 
-# Kolory
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+ARCHIVE_DIR="$KUBE_CLUSTERS_DIR/.archive"
+BACKUP_DIR="$HOME/.kube/backup-$(date +%Y%m%d-%H%M%S)"
 
 show_help() {
     echo "ocp-remove - Usuwanie klastrów z listy"
@@ -32,7 +21,7 @@ show_help() {
     echo "Opcje:"
     echo "  (brak)          Zarchiwizuj klaster (znika z listy, można przywrócić)"
     echo "  -r, --restore   Przywróć zarchiwizowany klaster"
-    echo "  -d, --delete    Usuń klaster trwale (z backupem w ~/.kube/backup-*)"
+    echo "  -d, --delete    Wyloguj i usuń klaster trwale (z backupem w ~/.kube/backup-*)"
     echo "  -l, --list      Pokaż zarchiwizowane klastry"
     echo "  -y, --yes       Nie pytaj o potwierdzenie"
     echo "  -h, --help      Pokaż tę pomoc"
@@ -44,35 +33,6 @@ show_help() {
     echo "  ocp-remove --delete stary-klaster   # trwałe usunięcie"
 }
 
-# Nazwa klastra = nazwa pliku; blokuje ścieżki typu ../ i ukryte pliki
-_valid_name() {
-    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
-}
-
-# Prefiks linii w cluster-registry.conf (jak w ocp-login: '-' → '_')
-_registry_prefix() {
-    echo "CLUSTER_API_${1//-/_}="
-}
-
-# Wypisz linie rejestru dla klastra
-_registry_lines() {
-    local prefix=$(_registry_prefix "$1")
-    [[ -f "$CLUSTER_CONFIG" ]] || return 0
-    awk -v p="$prefix" 'index($0, p) == 1' "$CLUSTER_CONFIG"
-}
-
-# Usuń linie rejestru dla klastra (z zachowaniem pozostałych)
-_registry_drop() {
-    local prefix=$(_registry_prefix "$1")
-    [[ -f "$CLUSTER_CONFIG" ]] || return 0
-
-    local tmp
-    tmp=$(mktemp "$CLUSTER_CONFIG.XXXXXX") || return 1
-    awk -v p="$prefix" 'index($0, p) != 1' "$CLUSTER_CONFIG" > "$tmp" &&
-        chmod 600 "$tmp" &&
-        mv "$tmp" "$CLUSTER_CONFIG"
-}
-
 _confirm() {
     [[ $ASSUME_YES -eq 1 ]] && return 0
     read -p "$1 (t/n): " answer
@@ -80,18 +40,18 @@ _confirm() {
 }
 
 _warn_if_active() {
-    local cluster_file="$1"
-    if [[ "$KUBECONFIG" == "$cluster_file" ]]; then
+    if [[ "$KUBECONFIG" == "$(ocp_cluster_file "$1")" ]]; then
         echo -e "  ${YELLOW}UWAGA: to aktualny klaster (KUBECONFIG) - przełącz się na inny${NC}"
     fi
 }
 
 archive_cluster() {
     local name="$1"
-    local cluster_file="$KUBE_DIR/$name"
+    local cluster_file
+    cluster_file=$(ocp_cluster_file "$name")
 
     if [[ ! -f "$cluster_file" ]]; then
-        echo -e "${RED}Klaster '$name' nie istnieje w $KUBE_DIR${NC}"
+        echo -e "${RED}Klaster '$name' nie istnieje w $KUBE_CLUSTERS_DIR${NC}"
         return 1
     fi
 
@@ -105,28 +65,13 @@ archive_cluster() {
 
     mv "$cluster_file" "$ARCHIVE_DIR/$name" || return 1
     echo -e "${GREEN}Zarchiwizowano: $name${NC}"
-
-    if [[ -f "$TOKENS_DIR/$name" ]]; then
-        mkdir -p "$TOKENS_ARCHIVE_DIR"
-        chmod 700 "$TOKENS_ARCHIVE_DIR"
-        mv "$TOKENS_DIR/$name" "$TOKENS_ARCHIVE_DIR/$name"
-        echo "  token → $TOKENS_ARCHIVE_DIR/$name"
-    fi
-
-    local lines=$(_registry_lines "$name")
-    if [[ -n "$lines" ]]; then
-        echo "$lines" > "$ARCHIVE_DIR/$name.registry"
-        chmod 600 "$ARCHIVE_DIR/$name.registry"
-        _registry_drop "$name"
-        echo "  wpis rejestru → $ARCHIVE_DIR/$name.registry"
-    fi
-
-    _warn_if_active "$cluster_file"
+    _warn_if_active "$name"
 }
 
 restore_cluster() {
     local name="$1"
-    local cluster_file="$KUBE_DIR/$name"
+    local cluster_file
+    cluster_file=$(ocp_cluster_file "$name")
 
     if [[ ! -f "$ARCHIVE_DIR/$name" ]]; then
         echo -e "${RED}Klaster '$name' nie istnieje w archiwum${NC}"
@@ -134,77 +79,55 @@ restore_cluster() {
     fi
 
     if [[ -e "$cluster_file" ]]; then
-        echo -e "${RED}Klaster '$name' już istnieje w $KUBE_DIR - nie nadpisuję${NC}"
+        echo -e "${RED}Klaster '$name' już istnieje w $KUBE_CLUSTERS_DIR - nie nadpisuję${NC}"
         return 1
     fi
 
     mv "$ARCHIVE_DIR/$name" "$cluster_file" || return 1
     echo -e "${GREEN}Przywrócono: $name${NC}"
-
-    if [[ -f "$TOKENS_ARCHIVE_DIR/$name" ]]; then
-        if [[ -e "$TOKENS_DIR/$name" ]]; then
-            echo -e "  ${YELLOW}token w $TOKENS_DIR/$name już istnieje - zostawiam zarchiwizowany${NC}"
-        else
-            mv "$TOKENS_ARCHIVE_DIR/$name" "$TOKENS_DIR/$name"
-            echo "  token przywrócony"
-        fi
-    fi
-
-    if [[ -f "$ARCHIVE_DIR/$name.registry" ]]; then
-        if [[ -z "$(_registry_lines "$name")" ]]; then
-            cat "$ARCHIVE_DIR/$name.registry" >> "$CLUSTER_CONFIG"
-            chmod 600 "$CLUSTER_CONFIG"
-            echo "  wpis rejestru przywrócony"
-        fi
-        rm -f "$ARCHIVE_DIR/$name.registry"
-    fi
 }
 
 delete_cluster() {
     local name="$1"
     local found=()
 
-    [[ -f "$KUBE_DIR/$name" ]] && found+=("$KUBE_DIR/$name")
+    [[ -f "$(ocp_cluster_file "$name")" ]] && found+=("$(ocp_cluster_file "$name")")
     [[ -f "$ARCHIVE_DIR/$name" ]] && found+=("$ARCHIVE_DIR/$name")
-    [[ -f "$ARCHIVE_DIR/$name.registry" ]] && found+=("$ARCHIVE_DIR/$name.registry")
-    [[ -f "$TOKENS_DIR/$name" ]] && found+=("$TOKENS_DIR/$name")
-    [[ -f "$TOKENS_ARCHIVE_DIR/$name" ]] && found+=("$TOKENS_ARCHIVE_DIR/$name")
 
-    local lines=$(_registry_lines "$name")
-
-    if [[ ${#found[@]} -eq 0 && -z "$lines" ]]; then
+    if [[ ${#found[@]} -eq 0 ]]; then
         echo -e "${RED}Klaster '$name' nie istnieje (ani w archiwum)${NC}"
         return 1
     fi
 
     echo -e "${YELLOW}Trwałe usunięcie klastra '$name':${NC}"
     printf '  %s\n' "${found[@]}"
-    [[ -n "$lines" ]] && echo "  wpis w $CLUSTER_CONFIG"
 
     if ! _confirm "Usunąć?"; then
         echo "Pominięto: $name"
         return 1
     fi
 
-    # Backup przed usunięciem
+    # Backup przed usunięciem, potem unieważnienie sesji na klastrze -
+    # samo skasowanie pliku zostawiłoby ważny token na serwerze
     mkdir -p "$BACKUP_DIR/$name"
     chmod 700 "$BACKUP_DIR"
-    # Nazwa w backupie ze ścieżki względem ~/.kube: clusters/.archive/x → clusters_archive_x
-    local f rel
+    local f
     for f in "${found[@]}"; do
-        rel="${f#"$HOME/.kube/"}"
-        rel="${rel//\/./\/}"
-        rel="${rel#.}"
-        rel="${rel//\//_}"
-        cp -a "$f" "$BACKUP_DIR/$name/$rel"
+        if [[ "$f" == "$ARCHIVE_DIR/"* ]]; then
+            cp -a "$f" "$BACKUP_DIR/$name/archive"
+        else
+            cp -a "$f" "$BACKUP_DIR/$name/active"
+        fi
+        if grep -q '^ *token: *[^ ]' "$f"; then
+            oc logout --kubeconfig="$f" --request-timeout="${OCP_TIMEOUT}s" &>/dev/null
+        fi
     done
-    [[ -n "$lines" ]] && echo "$lines" > "$BACKUP_DIR/$name/registry"
+    sed -i '/^ *token: /d' "$BACKUP_DIR/$name"/*
 
     rm -f "${found[@]}"
-    _registry_drop "$name"
 
-    echo -e "${GREEN}Usunięto: $name${NC} (backup: $BACKUP_DIR/$name)"
-    _warn_if_active "$KUBE_DIR/$name"
+    echo -e "${GREEN}Usunięto: $name${NC} (backup bez tokenów: $BACKUP_DIR/$name)"
+    _warn_if_active "$name"
 }
 
 list_archived() {
@@ -213,9 +136,8 @@ list_archived() {
     local count=0
     local cluster
     for cluster in "$ARCHIVE_DIR"/*; do
-        [[ -f "$cluster" && "$cluster" != *.registry ]] || continue
-        local api=$(grep "server:" "$cluster" 2>/dev/null | head -1 | awk '{print $2}')
-        echo "  $(basename "$cluster")  $api"
+        [[ -f "$cluster" ]] || continue
+        echo "  $(basename "$cluster")  $(ocp_cluster_server "$cluster")"
         ((count++))
     done
 
@@ -260,7 +182,7 @@ fi
 
 rc=0
 for name in "${CLUSTERS[@]}"; do
-    if ! _valid_name "$name"; then
+    if ! ocp_valid_name "$name"; then
         echo -e "${RED}Nieprawidłowa nazwa klastra: '$name'${NC}"
         rc=1
         continue

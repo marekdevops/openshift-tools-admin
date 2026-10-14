@@ -1,15 +1,14 @@
 #!/bin/bash
 #
 # tmux-ocp-status - Kolorowy status klastra dla tmux statusline
-# Używany przez tmux.conf
+#
+# Użycie w tmux.conf (nazwa klastra z opcji okna ustawianej przez 'ocp'):
+#   #(~/.local/share/openshift-tools/bin/tmux-ocp-status '#{@ocp_cluster}')
 #
 
-# Pobierz nazwę klastra
-if [[ -n "$OCP_CLUSTER" ]]; then
-    CLUSTER="$OCP_CLUSTER"
-elif [[ -n "$KUBECONFIG" ]]; then
-    CLUSTER=$(basename "$KUBECONFIG")
-else
+CLUSTER="$1"
+
+if [[ -z "$CLUSTER" ]]; then
     echo "#[fg=colour244]☸ ---"
     exit 0
 fi

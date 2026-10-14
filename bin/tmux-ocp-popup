@@ -1,0 +1,54 @@
+#!/bin/bash
+#
+# tmux-ocp-popup - Popupy tmux dla OpenShift (wywoływane z tmux.conf)
+#
+# Użycie:
+#   tmux-ocp-popup info     # informacje o klastrze bieżącego okna
+#   tmux-ocp-popup switch   # wybór klastra i 'ocp <klaster>' w aktywnym panelu
+#
+# Popup ma własne środowisko - klaster bieżącego okna jest czytany z opcji
+# okna @ocp_cluster (ustawianej przez funkcję 'ocp').
+#
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/ocp-common.sh" || exit 1
+
+case "${1:-}" in
+    info)
+        cluster=$(tmux display-message -p '#{@ocp_cluster}')
+        echo -e "${BLUE}=== OpenShift ===${NC}"
+        echo ""
+        if [[ -z "$cluster" ]]; then
+            echo "Brak klastra w tym oknie (użyj: ocp [klaster])"
+        else
+            "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/ocp-login" --status "$cluster"
+        fi
+        echo ""
+        read -p 'Naciśnij Enter...' _
+        ;;
+    switch)
+        pane=$(tmux display-message -p '#{pane_id}')
+        clusters=($(ocp_cluster_names))
+        if [[ ${#clusters[@]} -eq 0 ]]; then
+            echo "Brak klastrów"
+            read -p 'Naciśnij Enter...' _
+            exit 0
+        fi
+
+        if command -v fzf &> /dev/null; then
+            cluster=$(printf '%s\n' "${clusters[@]}" | fzf --header='Wybierz klaster:')
+        else
+            echo "Wybierz klaster:"
+            select cluster in "${clusters[@]}" "Anuluj"; do
+                [[ -n "$cluster" ]] && break
+            done
+            [[ "$cluster" == "Anuluj" ]] && cluster=""
+        fi
+
+        # Panel musi mieć aktywne środowisko (source ocp-activate)
+        [[ -n "$cluster" ]] && tmux send-keys -t "$pane" "ocp '$cluster'" Enter
+        ;;
+    *)
+        echo "Użycie: tmux-ocp-popup info|switch"
+        exit 1
+        ;;
+esac

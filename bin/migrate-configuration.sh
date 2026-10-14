@@ -3,7 +3,8 @@
 # migrate-configuration.sh - Przeniesienie całej konfiguracji OCP na inną maszynę
 #
 # Ten skrypt:
-# - Pakuje narzędzia (bin/, config/), klastry, tokeny i rejestr klastrów
+# - Pakuje narzędzia (bin/, lib/, config/), klastry i konfigurację (login, CA)
+# - Usuwa tokeny sesji z kubeconfigów - na nowej maszynie loguje się od nowa
 # - Wysyła paczkę przez scp i rozpakowuje ją na maszynie docelowej
 # - Robi backup plików, które zostałyby nadpisane
 # - Dodaje openshift-tools do PATH w ~/.bashrc na maszynie docelowej
@@ -14,8 +15,7 @@
 set -o pipefail
 
 KUBE_DIR="${KUBE_CLUSTERS_DIR:-$HOME/.kube/clusters}"
-TOKENS_DIR="${KUBE_TOKENS_DIR:-$HOME/.kube/tokens}"
-CLUSTER_CONFIG="$HOME/.kube/cluster-registry.conf"
+OCP_CONFIG_DIR="${OCP_CONFIG_DIR:-$HOME/.config/openshift-tools}"
 STARSHIP_CONFIG="$HOME/.config/starship.toml"
 LOCAL_BIN="$HOME/.local/bin"
 
@@ -50,10 +50,9 @@ show_help() {
     echo "  -h, --help        Pokaż tę pomoc"
     echo ""
     echo "Przenoszone elementy:"
-    echo "  $SRC_TOOLS_DIR/{bin,config}  → ~/$REMOTE_TOOLS_REL/"
-    echo "  ~/.kube/clusters/            (kubeconfigi klastrów)"
-    echo "  ~/.kube/tokens/              (tokeny)"
-    echo "  ~/.kube/cluster-registry.conf"
+    echo "  $SRC_TOOLS_DIR/{bin,lib,config}  → ~/$REMOTE_TOOLS_REL/"
+    echo "  ~/.kube/clusters/            (kubeconfigi klastrów, bez tokenów sesji)"
+    echo "  ~/.config/openshift-tools/   (login LDAP/AD, firmowe CA)"
     echo "  ~/.config/starship.toml"
     echo "  ~/.local/bin/{${BINARIES// /,}}"
     echo ""
@@ -143,7 +142,7 @@ mkdir -p "$STAGE_DIR/$REMOTE_TOOLS_REL" "$STAGE_DIR/.kube"
 
 # 1. Narzędzia
 echo -e "${CYAN}1. Narzędzia ($SRC_TOOLS_DIR):${NC}"
-for sub in bin config; do
+for sub in bin lib config; do
     if [[ -d "$SRC_TOOLS_DIR/$sub" ]]; then
         cp -a "$SRC_TOOLS_DIR/$sub" "$STAGE_DIR/$REMOTE_TOOLS_REL/"
         echo -e "   ${GREEN}$sub/${NC} ($(ls "$SRC_TOOLS_DIR/$sub" | wc -l) plików)"
@@ -160,14 +159,14 @@ if [[ -d "$KUBE_DIR" ]]; then
         if [[ -f "$cluster" ]]; then
             name=$(basename "$cluster")
             cp -a "$cluster" "$STAGE_DIR/.kube/clusters/"
+            # Sesja jest osobista i krótkotrwała - nie przenosimy tokenów.
+            # Bez tokenu pierwsze 'ocp klaster' zaloguje i utworzy plik od nowa
+            # (z poprawnymi ścieżkami, np. do CA, na maszynie docelowej).
+            sed -i '/^ *token: /d' "$STAGE_DIR/.kube/clusters/$name"
             api=$(grep "server:" "$cluster" 2>/dev/null | head -1 | awk '{print $2}')
             echo -e "   ${GREEN}$name${NC}  $api"
             ((cluster_count++))
 
-            # Ścieżki bezwzględne do $HOME nie zadziałają przy innym użytkowniku
-            if grep -q "$HOME/" "$cluster" 2>/dev/null; then
-                echo -e "   ${YELLOW}→ UWAGA: plik zawiera ścieżki do $HOME${NC}"
-            fi
         fi
     done
 fi
@@ -176,28 +175,26 @@ if [[ $cluster_count -eq 0 ]]; then
 fi
 echo ""
 
-# 3. Tokeny
-echo -e "${CYAN}3. Tokeny ($TOKENS_DIR):${NC}"
-token_count=0
-if [[ -d "$TOKENS_DIR" ]]; then
-    cp -a "$TOKENS_DIR" "$STAGE_DIR/.kube/tokens"
-    token_count=$(find "$TOKENS_DIR" -type f | wc -l)
-fi
-echo "   Plików: $token_count"
-echo ""
+# 3. Konfiguracja (login LDAP/AD, CA)
+echo -e "${CYAN}3. Konfiguracja ($OCP_CONFIG_DIR):${NC}"
+if [[ -d "$OCP_CONFIG_DIR" ]]; then
+    mkdir -p "$STAGE_DIR/.config"
+    cp -a "$OCP_CONFIG_DIR" "$STAGE_DIR/.config/"
+    grep -E '^OCP_(USER|CA_FILE)=' "$OCP_CONFIG_DIR/config" 2>/dev/null | sed 's/^/   /'
 
-# 4. Rejestr klastrów
-echo -e "${CYAN}4. Rejestr klastrów:${NC}"
-if [[ -f "$CLUSTER_CONFIG" ]]; then
-    cp -a "$CLUSTER_CONFIG" "$STAGE_DIR/.kube/"
-    echo "   Wpisów: $(grep -c "^CLUSTER_API_" "$CLUSTER_CONFIG")"
+    # CA spoza katalogu konfiguracji nie zostanie przeniesione
+    ca_file=$(grep '^OCP_CA_FILE=' "$OCP_CONFIG_DIR/config" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    ca_file="${ca_file/#\~/$HOME}"
+    if [[ -n "$ca_file" && "$ca_file" != "$OCP_CONFIG_DIR/"* ]]; then
+        echo -e "   ${YELLOW}→ UWAGA: CA ($ca_file) jest poza $OCP_CONFIG_DIR - skopiuj je ręcznie${NC}"
+    fi
 else
-    echo -e "   ${YELLOW}(brak $CLUSTER_CONFIG)${NC}"
+    echo -e "   ${YELLOW}(brak - ustaw na maszynie docelowej: ocp-login --set-user)${NC}"
 fi
 echo ""
 
-# 5. Starship
-echo -e "${CYAN}5. Konfiguracja starship:${NC}"
+# 4. Starship
+echo -e "${CYAN}4. Konfiguracja starship:${NC}"
 if [[ -f "$STARSHIP_CONFIG" ]]; then
     mkdir -p "$STAGE_DIR/.config"
     cp -a "$STARSHIP_CONFIG" "$STAGE_DIR/.config/"
@@ -207,8 +204,8 @@ else
 fi
 echo ""
 
-# 6. Binarki
-echo -e "${CYAN}6. Binarki ($LOCAL_BIN):${NC}"
+# 5. Binarki
+echo -e "${CYAN}5. Binarki ($LOCAL_BIN):${NC}"
 binaries_staged=0
 if [[ $WITH_BINARIES -eq 1 ]]; then
     for binary in $BINARIES; do
@@ -231,7 +228,6 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 if [[ $ASSUME_YES -ne 1 ]]; then
-    echo -e "${YELLOW}UWAGA: Tokeny dostępowe do klastrów zostaną skopiowane na $TARGET${NC}"
     read -p "Kontynuować? (t/n): " CONFIRM
     if [[ "$CONFIRM" != "t" ]]; then
         echo "Przerwano."
@@ -314,12 +310,13 @@ if ! tar -xzpf "$ARCHIVE" --no-overwrite-dir -C "$HOME"; then
 fi
 
 # Uprawnienia
-chmod 700 .kube/clusters .kube/tokens 2>/dev/null
-find .kube/clusters .kube/tokens -type f -exec chmod 600 {} + 2>/dev/null
+chmod 700 .kube/clusters .config/openshift-tools 2>/dev/null
+find .kube/clusters .config/openshift-tools -type f -exec chmod 600 {} + 2>/dev/null
 chmod 755 .local .local/share .local/bin .local/share/openshift-tools \
-    .local/share/openshift-tools/bin .local/share/openshift-tools/config 2>/dev/null
+    .local/share/openshift-tools/bin .local/share/openshift-tools/lib \
+    .local/share/openshift-tools/config 2>/dev/null
 chmod 755 .local/share/openshift-tools/bin/* 2>/dev/null
-chmod 644 .local/share/openshift-tools/config/* 2>/dev/null
+chmod 644 .local/share/openshift-tools/lib/* .local/share/openshift-tools/config/* 2>/dev/null
 
 echo "Klastry: $(find .kube/clusters -type f 2>/dev/null | wc -l)"
 
@@ -352,4 +349,4 @@ echo -e "${GREEN}✓ Migracja zakończona${NC}"
 echo ""
 echo "Na maszynie $TARGET (w nowej sesji):"
 echo "  source ocp-activate"
-echo "  ocp-check"
+echo "  ocp [klaster]          # zaloguje przy pierwszym przełączeniu"

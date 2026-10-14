@@ -10,6 +10,7 @@ openshift-tools/
 │   ├── ocp-activate              # Aktywacja środowiska (styl venv)
 │   ├── ocp-switch                # Przełączanie między klastrami
 │   ├── ocp-login                 # Logowanie do klastrów
+│   ├── ocp-remove                # Usuwanie/archiwizacja klastrów z listy
 │   ├── ocp-create-sa-token       # Tworzenie ServiceAccount z tokenem
 │   └── ocp-generate-kubeconfig   # Generowanie plików kubeconfig
 ├── config/
@@ -284,6 +285,20 @@ source ocp-switch prod-cluster1
 kprod1
 kdev
 kstg
+```
+
+### Usuwanie nieużywanych klastrów z listy
+
+```bash
+# Archiwizacja - klaster znika z listy, można go przywrócić
+ocp-remove stary-klaster
+
+# Lista zarchiwizowanych i przywrócenie
+ocp-remove --list
+ocp-remove --restore stary-klaster
+
+# Trwałe usunięcie (kubeconfig, token, wpis w rejestrze; backup w ~/.kube/backup-*)
+ocp-remove --delete stary-klaster
 ```
 
 ### Sprawdzanie aktualnego klastra

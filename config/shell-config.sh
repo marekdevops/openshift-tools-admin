@@ -300,6 +300,22 @@ _ocp_switch_completions() {
 complete -F _ocp_switch_completions ocp-switch
 complete -F _ocp_switch_completions ocp
 
+# Autouzupełnianie dla ocp-remove (--restore podpowiada klastry z archiwum)
+_ocp_remove_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local dir="$KUBE_CLUSTERS_DIR"
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "--restore --delete --list --yes --help" -- "$cur"))
+        return
+    fi
+
+    [[ " ${COMP_WORDS[*]} " == *" --restore "* || " ${COMP_WORDS[*]} " == *" -r "* ]] && dir="$KUBE_CLUSTERS_DIR/.archive"
+    local clusters=$(ls "$dir" 2>/dev/null | grep -v '\.registry$')
+    COMPREPLY=($(compgen -W "$clusters" -- "$cur"))
+}
+complete -F _ocp_remove_completions ocp-remove
+
 # ============================================
 # INFO NA STARCIE
 # ============================================

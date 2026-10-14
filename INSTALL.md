@@ -1,390 +1,366 @@
-# OpenShift Tools - Instrukcja instalacji
+# OpenShift Tools - Instrukcja
 
-Kompletny zestaw narzędzi do zarządzania wieloma klastrami OpenShift.
+Narzędzia do pracy z wieloma klastrami OpenShift **na własnym koncie LDAP/AD**.
+Każda operacja na klastrze jest wykonywana jako Twój użytkownik, więc audit logi
+klastra pokazują, kto co zrobił. Nie ma wspólnego konta ServiceAccount ani tokenów, które nie wygasają.
 
-## Zawartość paczki
+## Jak to działa
+
+```
+source ocp-activate        → wejście do środowiska, wczytanie loginu AD
+ocp klaster1               → przełączenie; jeśli sesja wygasła - pytanie o hasło AD
+ocp klaster2               → j.w.
+ocp-deactivate             → wyjście
+```
+
+- Każdy klaster to osobny plik kubeconfig: `~/.kube/clusters/<nazwa>`.
+- Logowanie: `oc login -u <Twój login>`. Hasło wpisujesz bezpośrednio do `oc`,
+  skrypty go nie widzą i nigdzie nie zapisują.
+- Token sesji OAuth jest ważny zwykle 24h. Po wygaśnięciu `ocp klaster`
+  poprosi o hasło ponownie. Kubeconfigi są wspólne dla wszystkich terminali
+  i okien tmux, więc wystarczy zalogować się raz.
+- Hasło jest wysyłane **tylko** do serwerów z zaufanym certyfikatem (firmowe CA).
+  Jeśli certyfikat się nie zgadza, logowanie jest przerywane przed pytaniem o hasło.
+
+## Zawartość
 
 ```
 openshift-tools/
-├── bin/                          # Skrypty
-│   ├── ocp-activate              # Aktywacja środowiska (styl venv)
-│   ├── ocp-switch                # Przełączanie między klastrami
-│   ├── ocp-login                 # Logowanie do klastrów
-│   ├── ocp-remove                # Usuwanie/archiwizacja klastrów z listy
-│   ├── ocp-create-sa-token       # Tworzenie ServiceAccount z tokenem
-│   └── ocp-generate-kubeconfig   # Generowanie plików kubeconfig
+├── install.sh                    # Instalacja i pierwsza konfiguracja
+├── bin/
+│   ├── ocp-activate              # Wejście do środowiska (source)
+│   ├── ocp-login                 # Logowanie, dodawanie klastrów, konfiguracja
+│   ├── ocp-remove                # Archiwizacja/usuwanie klastrów
+│   ├── ocp-tmux                  # Sesja tmux z oknem na klaster
+│   ├── tmux-ocp-status           # Kolorowy klaster w statusline tmux
+│   ├── tmux-ocp-popup            # Popupy tmux (Prefix+o, Prefix+O)
+│   └── migrate-configuration.sh  # Przeniesienie konfiguracji na inną maszynę
+├── lib/
+│   └── ocp-common.sh             # Wspólne funkcje
 ├── config/
-│   ├── starship.toml             # Konfiguracja promptu Starship
-│   └── shell-config.sh           # Aliasy i funkcje shell
-├── downloads/                    # Binaria do instalacji offline
-│   ├── kubectx_v0.9.5_linux_x86_64.tar.gz
-│   ├── kubens_v0.9.5_linux_x86_64.tar.gz
-│   └── starship-x86_64-unknown-linux-gnu.tar.gz
-└── INSTALL.md                    # Ta instrukcja
+│   ├── starship.toml             # Prompt Starship (opcjonalnie)
+│   ├── tmux.conf                 # Pełna konfiguracja tmux (opcjonalnie)
+│   └── tmux-ocp-addon.conf       # Dodatek do istniejącego tmux.conf
+└── downloads/                    # Binaria do instalacji offline
 ```
 
 ---
 
-## CZĘŚĆ 1: Instalacja na hoście przesiadkowym (offline)
+## 1. Instalacja
 
-### 1.1 Skopiuj paczkę na host
+### 1.1 Wymagania
+
+- `oc` (OpenShift CLI) w `PATH` lub w `~/.local/bin`
+- `curl`, `bash` 4+
+- opcjonalnie: `tmux` (≥ 3.2 dla popupów), `starship`, `fzf`
+
+Na hoście bez internetu skopiuj paczkę i rozpakuj binaria z `downloads/`:
 
 ```bash
-scp -r openshift-tools/ user@bastion-host:/tmp/
-```
+scp -r openshift-tools/ user@bastion:/tmp/
+ssh user@bastion
 
-### 1.2 Zainstaluj na hoście
-
-```bash
-# Połącz się z hostem
-ssh user@bastion-host
-
-# Utwórz katalogi
-mkdir -p ~/.local/share/openshift-tools/{bin,config}
 mkdir -p ~/.local/bin
-mkdir -p ~/.config
-mkdir -p ~/.kube/{clusters,tokens}
-
-# Skopiuj skrypty
-cp /tmp/openshift-tools/bin/* ~/.local/share/openshift-tools/bin/
-chmod +x ~/.local/share/openshift-tools/bin/*
-
-# Skopiuj konfiguracje
-cp /tmp/openshift-tools/config/* ~/.local/share/openshift-tools/config/
-
-# Rozpakuj narzędzia
 cd /tmp/openshift-tools/downloads
-
-tar -xzf kubectx_v0.9.5_linux_x86_64.tar.gz -C ~/.local/bin/
-tar -xzf kubens_v0.9.5_linux_x86_64.tar.gz -C ~/.local/bin/
-tar -xzf starship-x86_64-unknown-linux-gnu.tar.gz -C ~/.local/bin/
-
-# Sprawdź
-ls -la ~/.local/bin/
+tar -xzf starship-x86_64-unknown-linux-gnu.tar.gz -C ~/.local/bin/   # opcjonalnie
+tar -xzf kubectx_v0.9.5_linux_x86_64.tar.gz -C ~/.local/bin/          # opcjonalnie
+tar -xzf kubens_v0.9.5_linux_x86_64.tar.gz -C ~/.local/bin/           # opcjonalnie
 ```
 
-### 1.3 Skonfiguruj shell
+### 1.2 Firmowe CA
 
-**OPCJA A: Aktywacja na żądanie (styl Python venv) - ZALECANE**
+Certyfikaty API (`api.*:6443`) i serwera logowania (`oauth-openshift.apps.*`)
+są podpisane firmowym CA. Narzędzia muszą temu CA ufać. Są dwie możliwości:
 
-Dodaj tylko ścieżkę do `~/.bashrc`:
+- **CA jest w systemowym magazynie** (`/etc/pki/ca-trust/`): nic nie trzeba robić.
+  Sprawdzenie: `curl -sS https://api.KLASTER:6443/version` działa bez `-k`.
+- **CA jako plik PEM**: podaj go przy instalacji. Zostanie skopiowany do
+  `~/.config/openshift-tools/ca-bundle.pem`. Jeśli jest CA pośrednie, plik
+  powinien zawierać cały łańcuch (kilka bloków `BEGIN CERTIFICATE`).
+
+### 1.3 Uruchom instalator
 
 ```bash
-# OpenShift Tools - tylko PATH
-export PATH="$HOME/.local/bin:$HOME/.local/share/openshift-tools/bin:$PATH"
+cd /tmp/openshift-tools
+./install.sh
 ```
 
-Środowisko aktywujesz gdy potrzebujesz:
+Instalator:
+
+1. sprawdza wymagania,
+2. kopiuje narzędzia do `~/.local/share/openshift-tools` i dodaje je do `PATH` w `~/.bashrc`,
+3. pyta o **login LDAP/AD** i zapisuje go w `~/.config/openshift-tools/config`,
+4. pyta o plik **firmowego CA** (Enter = systemowy magazyn),
+5. kopiuje `starship.toml`, jeśli go jeszcze nie masz,
+6. pozwala od razu **dodać klastry** (nazwa + API URL); każdy klaster jest od razu testowany logowaniem.
+
+Bez pytań: `./install.sh --user jan.kowalski --ca /ścieżka/firmowe-ca.pem`
+
+Potem otwórz nową sesję albo wykonaj `source ~/.bashrc`.
+
+### 1.4 Aktualizacja
+
+Uruchom `./install.sh` z nowej wersji paczki. Konfiguracja i klastry zostają.
+
+---
+
+## 2. Codzienna praca
 
 ```bash
-source ocp-activate           # aktywuj środowisko
-source ocp-activate prod1     # aktywuj i przełącz na klaster
-
-# Praca z OpenShift...
-
-ocp-deactivate                # dezaktywuj gdy skończysz
+source ocp-activate            # wejście, pokazuje skonfigurowany login
+ocp                            # lista klastrów ze statusem sesji
+ocp prod-cluster1              # przełączenie (+ logowanie, jeśli trzeba)
+ocp dev-cluster                # j.w.
+ocp-current                    # szczegóły aktualnego klastra
+ocp-deactivate                 # wyjście
 ```
 
-**OPCJA B: Automatyczna aktywacja przy logowaniu**
+`source ocp-activate prod-cluster1` aktywuje środowisko i od razu przełącza na klaster.
+Nazwy klastrów podpowiada `Tab`.
 
-Dodaj do `~/.bashrc` (lub `~/.zshrc`):
+Przykładowa sesja:
 
-```bash
-# OpenShift Tools
-export OCP_TOOLS_DIR="$HOME/.local/share/openshift-tools"
-export PATH="$HOME/.local/bin:$OCP_TOOLS_DIR/bin:$PATH"
+```
+$ source ocp-activate
+✓ Środowisko OpenShift aktywowane
+  Użytkownik: jan.kowalski
 
-# Załaduj konfigurację
-source "$OCP_TOOLS_DIR/config/shell-config.sh"
+(ocp) $ ocp prod-cluster1
+Przełączono na: prod-cluster1
+Logowanie do prod-cluster1 jako jan.kowalski (https://api.prod1.example.com:6443)
+Authentication required for https://api.prod1.example.com:6443 (openshift)
+Username: jan.kowalski
+Password:
+Login successful.
+Zalogowano do prod-cluster1
+⚠️  UWAGA: Środowisko PRODUKCYJNE!
+
+[prod-cluster1/default] $ ocp
+Klastry (użytkownik: jan.kowalski)
+* prod-cluster1            zalogowany (jan.kowalski)
+  dev-cluster              sesja wygasła
+  test-cluster             niedostępny
 ```
 
-### 1.4 Skonfiguruj Starship (opcjonalne, dla OPCJI B)
+Statusy sesji:
+
+| Status | Znaczenie | Co zrobi `ocp klaster` |
+|---|---|---|
+| `zalogowany` | ważna sesja Twojego konta | tylko przełączy |
+| `sesja wygasła` | token wygasł lub został unieważniony | zapyta o hasło |
+| `niezalogowany` | brak sesji (nowy klaster, po wylogowaniu, po migracji) | zapyta o hasło |
+| `inne konto: …` | kubeconfig ma sesję innego konta (np. starego SA) | zaloguje Twoim kontem |
+| `niedostępny` | brak połączenia (sieć, VPN, klaster) | tylko przełączy |
+
+### Wylogowanie
 
 ```bash
-# Skopiuj konfigurację
-cp ~/.local/share/openshift-tools/config/starship.toml ~/.config/starship.toml
+ocp-logout                     # aktualny klaster
+ocp-logout dev-cluster         # wybrany klaster
+ocp-logout --all               # wszystkie
+ocp-deactivate --logout        # wyjście + wylogowanie ze wszystkich
+```
 
-# Dodaj do ~/.bashrc (na końcu pliku)
+Wylogowanie **unieważnia token na klastrze**, a nie tylko usuwa go lokalnie.
+Warto to robić na koniec dnia na współdzielonych hostach.
+
+### Wymuszenie ponownego logowania
+
+```bash
+ocp-login prod-cluster1
+```
+
+---
+
+## 3. Zarządzanie klastrami
+
+### Dodanie klastra
+
+```bash
+ocp-add prod-cluster1 https://api.prod1.example.com:6443
+# poza aktywnym środowiskiem:
+ocp-login --add prod-cluster1 https://api.prod1.example.com:6443
+```
+
+Nazwa jest dowolna (litery, cyfry, `.`, `_`, `-`). Nazwa zawierająca `prod`
+daje czerwony prompt i ostrzeżenie, `stag` żółty, `dev` zielony, `test` niebieski.
+
+### Usunięcie nieużywanego klastra z listy
+
+```bash
+ocp-remove stary-klaster              # archiwizacja (znika z listy)
+ocp-remove --list                     # zarchiwizowane
+ocp-remove --restore stary-klaster    # przywrócenie
+ocp-remove --delete stary-klaster     # wylogowanie + trwałe usunięcie
+```
+
+`--delete` robi backup (bez tokenu) w `~/.kube/backup-<data>/`.
+
+### Konfiguracja
+
+```bash
+ocp-login --config                    # pokaż
+ocp-login --set-user jan.kowalski     # zmień login
+ocp-login --set-ca ~/firmowe-ca.pem   # zmień CA
+ocp-login --set-ca none               # użyj systemowego magazynu
+```
+
+Plik: `~/.config/openshift-tools/config`. Zmienne środowiskowe `OCP_USER`
+i `OCP_CA_FILE` mają pierwszeństwo przed plikiem.
+
+---
+
+## 4. tmux (opcjonalnie)
+
+```bash
+ocp-tmux                       # sesja z oknem na każdy klaster
+ocp-tmux prod-cluster1 dev     # tylko wybrane
+ocp-tmux -a                    # dołącz do istniejącej sesji
+ocp-tmux -k                    # zamknij sesję
+```
+
+`ocp-tmux` najpierw loguje (w bieżącym terminalu) do klastrów z wygasłą sesją,
+dopiero potem otwiera okna. Okna nie pytają więc o hasło jednocześnie.
+
+Konfiguracja tmux - jedna z opcji:
+
+```bash
+# pełna konfiguracja
+cp ~/.local/share/openshift-tools/config/tmux.conf ~/.tmux.conf
+# albo dodatek do istniejącej
+echo "source-file ~/.local/share/openshift-tools/config/tmux-ocp-addon.conf" >> ~/.tmux.conf
+```
+
+Statusline pokazuje klaster **bieżącego okna** (opcja okna `@ocp_cluster`,
+ustawiana przez `ocp`). Skróty: `Prefix+o` informacje o klastrze, `Prefix+O`
+wybór klastra.
+
+---
+
+## 5. Prompt Starship (opcjonalnie)
+
+`ocp-activate` sam dodaje do promptu `[klaster/namespace]`. Jeśli wolisz
+Starship, dodaj do `~/.bashrc`:
+
+```bash
 eval "$(starship init bash)"
-
-# Dla zsh:
-# eval "$(starship init zsh)"
 ```
 
-### 1.5 Przeładuj shell
-
-```bash
-source ~/.bashrc
-```
+Nazwa kontekstu w kubeconfig to nazwa klastra, więc aliasy w
+`~/.config/starship.toml` (`[kubernetes.context_aliases]`) używają nazw klastrów.
 
 ---
 
-## CZĘŚĆ 2: Tworzenie nie wygasających tokenów (Service Account)
-
-**WAŻNE:** Wykonaj te kroki na każdym klastrze, do którego chcesz mieć dostęp.
-
-### 2.1 Zaloguj się do klastra jako cluster-admin
+## 6. Przeniesienie na inną maszynę
 
 ```bash
-oc login https://api.KLASTER.example.com:6443 -u admin
+migrate-configuration.sh user@nowy-bastion.example.com
+migrate-configuration.sh -n user@nowy-bastion.example.com   # podgląd
 ```
 
-### 2.2 Utwórz ServiceAccount z tokenem
-
-**Metoda A: Użyj dostarczonego skryptu**
-
-```bash
-ocp-create-sa-token
-```
-
-Skrypt automatycznie:
-- Utworzy ServiceAccount `ocp-admin-sa` w namespace `openshift-config`
-- Nada mu uprawnienia `cluster-admin`
-- Wygeneruje nie wygasający token
-- Wyświetli token do skopiowania
-
-**Metoda B: Ręcznie (jeśli wolisz)**
-
-```bash
-# 1. Utwórz ServiceAccount
-oc create serviceaccount ocp-admin-sa -n openshift-config
-
-# 2. Nadaj uprawnienia cluster-admin
-oc adm policy add-cluster-role-to-user cluster-admin \
-    system:serviceaccount:openshift-config:ocp-admin-sa
-
-# 3. Utwórz Secret z tokenem (OCP 4.11+)
-cat <<EOF | oc apply -f -
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ocp-admin-sa-token
-  namespace: openshift-config
-  annotations:
-    kubernetes.io/service-account.name: ocp-admin-sa
-type: kubernetes.io/service-account-token
-EOF
-
-# 4. Pobierz token (poczekaj 2-3 sekundy)
-oc get secret ocp-admin-sa-token -n openshift-config \
-    -o jsonpath='{.data.token}' | base64 -d && echo
-```
-
-### 2.3 Zapisz token
-
-```bash
-# Utwórz katalog na tokeny
-mkdir -p ~/.kube/tokens
-chmod 700 ~/.kube/tokens
-
-# Zapisz token (zastąp NAZWA_KLASTRA)
-echo 'TUTAJ_WKLEJ_TOKEN' > ~/.kube/tokens/NAZWA_KLASTRA
-chmod 600 ~/.kube/tokens/NAZWA_KLASTRA
-```
+Przenoszone są: narzędzia, lista klastrów, login i CA (`~/.config/openshift-tools`),
+`starship.toml` i binaria z `~/.local/bin`. **Tokeny sesji nie są przenoszone.**
+Na nowej maszynie pierwsze `ocp klaster` poprosi o hasło.
 
 ---
 
-## CZĘŚĆ 3: Przygotowanie plików kubeconfig
+## 7. Przejście z tokenów ServiceAccount (`ocp-admin-sa`)
 
-### 3.1 Metoda A: Automatyczna (zalecana)
+Poprzednia wersja narzędzi logowała się wspólnym kontem `ocp-admin-sa` z rolą
+`cluster-admin` i tokenem, który nie wygasał. Takie konto uniemożliwia rozliczalność
+i narusza polityki bezpieczeństwa. Po przejściu na logowanie własnym kontem:
 
-Po zalogowaniu się tokenem:
+### 7.1 Lokalnie
 
-```bash
-ocp-generate-kubeconfig prod-cluster1 https://api.prod1.example.com:6443
-```
+1. Zainstaluj nową wersję (`./install.sh`). Istniejące pliki w `~/.kube/clusters/`
+   zostają. `ocp` pokaże przy nich `inne konto: system:serviceaccount:...`, a pierwsze
+   `ocp klaster` zaloguje Twoim kontem i nadpisze sesję SA.
+2. Usuń stare tokeny i rejestr:
+   ```bash
+   rm -rf ~/.kube/tokens
+   rm -f ~/.kube/cluster-registry.conf
+   ```
+3. Usuń z `~/.bashrc` wpisy `source .../shell-config.sh` i aliasy `kprod1` itp.
+   (narzędzia `ocp-switch`, `ocp-create-sa-token`, `ocp-generate-kubeconfig`,
+   `ocp-migrate` i `shell-config.sh` zostały usunięte; zastępuje je `ocp`).
+4. Usuń stare kopie tokenów: `~/.kube/backup-*` z wcześniejszych migracji
+   oraz kopie na innych maszynach.
 
-Skrypt poprosi o token i wygeneruje plik kubeconfig.
+### 7.2 Na każdym klastrze
 
-### 3.2 Metoda B: Ręczne tworzenie kubeconfig
-
-Utwórz plik `~/.kube/clusters/NAZWA_KLASTRA`:
-
-```yaml
-apiVersion: v1
-kind: Config
-preferences: {}
-
-clusters:
-- cluster:
-    server: https://api.KLASTER.example.com:6443
-    insecure-skip-tls-verify: true
-  name: NAZWA_KLASTRA
-
-contexts:
-- context:
-    cluster: NAZWA_KLASTRA
-    user: NAZWA_KLASTRA-admin
-    namespace: default
-  name: NAZWA_KLASTRA
-
-current-context: NAZWA_KLASTRA
-
-users:
-- name: NAZWA_KLASTRA-admin
-  user:
-    token: TUTAJ_WKLEJ_CALY_TOKEN
-```
-
-Zastąp:
-- `NAZWA_KLASTRA` - nazwa identyfikująca klaster (np. `prod-cluster1`)
-- `https://api.KLASTER.example.com:6443` - URL API klastra
-- `TUTAJ_WKLEJ_CALY_TOKEN` - token z kroku 2
+Dopóki Secret z tokenem istnieje, token SA działa, także z każdej maszyny,
+na którą został skopiowany. Po zalogowaniu własnym kontem:
 
 ```bash
-chmod 600 ~/.kube/clusters/NAZWA_KLASTRA
+oc delete clusterrolebinding ocp-admin-sa-cluster-admin
+oc delete secret ocp-admin-sa-token -n openshift-config
+oc delete serviceaccount ocp-admin-sa -n openshift-config
 ```
 
-### 3.3 Metoda C: Użycie oc login
+Sprawdzenie, że nic nie zostało:
 
 ```bash
-# Zaloguj się i zapisz do osobnego pliku kubeconfig
-oc login https://api.prod1.example.com:6443 \
-    --token="$(cat ~/.kube/tokens/prod-cluster1)" \
-    --kubeconfig=~/.kube/clusters/prod-cluster1
+oc get clusterrolebinding -o wide | grep ocp-admin-sa
+oc get sa,secret -n openshift-config | grep ocp-admin-sa
 ```
 
----
+### 7.3 Uprawnienia (do rozważenia)
 
-## CZĘŚĆ 4: Konfiguracja aliasów dla klastrów
-
-Edytuj `~/.local/share/openshift-tools/config/shell-config.sh` i dostosuj aliasy:
+Zasada najmniejszych uprawnień: na co dzień konto bez `cluster-admin`,
+z rolą `sudoer`, a uprawnienia admina tylko gdy są potrzebne:
 
 ```bash
-# Zmień te linie na swoje klastry:
-alias kprod1='export KUBECONFIG=$KUBE_CLUSTERS_DIR/prod-cluster1 && echo "🔴 PRODUKCJA 1"'
-alias kprod2='export KUBECONFIG=$KUBE_CLUSTERS_DIR/prod-cluster2 && echo "🔴 PRODUKCJA 2"'
-alias kstg='export KUBECONFIG=$KUBE_CLUSTERS_DIR/staging && echo "🟡 STAGING"'
-alias kdev='export KUBECONFIG=$KUBE_CLUSTERS_DIR/dev && echo "🟢 DEV"'
+oc adm policy add-cluster-role-to-user sudoer jan.kowalski
+oc delete pod xyz --as=system:admin
 ```
 
-Edytuj też `~/.config/starship.toml` - sekcję `[kubernetes.context_aliases]`:
-
-```toml
-[kubernetes.context_aliases]
-"prod-cluster1" = "🔴 PROD-1"
-"prod-cluster2" = "🔴 PROD-2"
-"staging" = "🟡 STAGE"
-"dev" = "🟢 DEV"
-```
-
----
-
-## CZĘŚĆ 5: Użytkowanie
-
-### Przełączanie klastrów
-
-```bash
-# Lista dostępnych klastrów
-ocp-switch
-
-# Przełącz na klaster
-source ocp-switch prod-cluster1
-
-# Lub użyj aliasu
-kprod1
-kdev
-kstg
-```
-
-### Usuwanie nieużywanych klastrów z listy
-
-```bash
-# Archiwizacja - klaster znika z listy, można go przywrócić
-ocp-remove stary-klaster
-
-# Lista zarchiwizowanych i przywrócenie
-ocp-remove --list
-ocp-remove --restore stary-klaster
-
-# Trwałe usunięcie (kubeconfig, token, wpis w rejestrze; backup w ~/.kube/backup-*)
-ocp-remove --delete stary-klaster
-```
-
-### Sprawdzanie aktualnego klastra
-
-```bash
-ocp-current
-# lub
-ocp-switch -c
-```
-
-### Prompt Starship
-
-Po poprawnej konfiguracji, prompt będzie wyglądał tak:
-
-```
-☸ 🔴 PROD-1 (default) ~/projects/app
-❯
-```
-
-Gdzie:
-- `🔴 PROD-1` - nazwa klastra (czerwony = produkcja)
-- `(default)` - aktualny namespace/projekt
+Audit log zapisuje wtedy i Twoje konto, i użycie uprawnień admina.
 
 ---
 
 ## Rozwiązywanie problemów
 
-### Token wygasł lub nie działa
+### „Certyfikat … nie jest zaufany”
+
+Logowanie zostało przerwane, zanim padło pytanie o hasło. Sprawdź oba adresy:
 
 ```bash
-# Sprawdź czy secret istnieje
-oc get secret ocp-admin-sa-token -n openshift-config
-
-# Jeśli nie, utwórz ponownie
-ocp-create-sa-token
-
-# Pobierz nowy token
-oc get secret ocp-admin-sa-token -n openshift-config \
-    -o jsonpath='{.data.token}' | base64 -d
+curl -sS https://api.KLASTER:6443/version
+curl -sS https://oauth-openshift.apps.KLASTER/healthz
+# z plikiem CA:
+curl -sS --cacert ~/.config/openshift-tools/ca-bundle.pem https://api.KLASTER:6443/version
 ```
 
-### Starship nie pokazuje kontekstu
+Jeśli działa tylko z `--cacert`, ustaw: `ocp-login --set-ca PLIK`. Jeśli API ma
+inne CA niż `*.apps` (np. wewnętrzne CA OpenShift), połącz oba w jednym pliku:
+`cat firmowe-ca.pem api-ca.pem > ~/.config/openshift-tools/ca-bundle.pem`.
+
+### „Login failed (401 Unauthorized)”
+
+Błędne hasło albo konto nie ma dostępu do klastra (identity provider LDAP).
+**Uwaga na blokadę konta AD** po kilku błędnych próbach.
+
+### Klaster `niedostępny`
 
 ```bash
-# Sprawdź czy KUBECONFIG jest ustawiony
-echo $KUBECONFIG
-
-# Sprawdź czy plik istnieje
-ls -la $KUBECONFIG
-
-# Sprawdź czy starship działa
-starship --version
+curl -sS https://api.KLASTER:6443/version     # sieć/VPN/DNS
 ```
 
-### Nie można połączyć się z klastrem
+Czas oczekiwania na odpowiedź: zmienna `OCP_TIMEOUT` (domyślnie 5 s).
 
-```bash
-# Sprawdź połączenie sieciowe
-curl -k https://api.KLASTER.example.com:6443/healthz
+### `oc` używa złego klastra / `system:anonymous`
 
-# Sprawdź token
-oc whoami
-
-# Sprawdź uprawnienia
-oc auth can-i '*' '*' --all-namespaces
-```
+Po `source ocp-activate` zmienna `KUBECONFIG` nie jest ustawiona, dopóki nie
+wykonasz `ocp klaster`. Domyślny `~/.kube/config` jest celowo pusty, więc `oc`
+bez wybranego klastra zgłasza błąd zamiast działać na przypadkowym klastrze.
 
 ---
 
-## Bezpieczeństwo
+## Bezpieczeństwo - podsumowanie
 
-1. **Uprawnienia plików:**
-   ```bash
-   chmod 700 ~/.kube/tokens
-   chmod 600 ~/.kube/tokens/*
-   chmod 600 ~/.kube/clusters/*
-   ```
-
-2. **Rotacja tokenów** - jeśli podejrzewasz kompromitację:
-   ```bash
-   oc delete secret ocp-admin-sa-token -n openshift-config
-   # Następnie utwórz nowy token
-   ```
-
-3. **Usunięcie dostępu:**
-   ```bash
-   oc delete serviceaccount ocp-admin-sa -n openshift-config
-   oc delete clusterrolebinding ocp-admin-sa-cluster-admin
-   ```
+- Wszystkie operacje są wykonywane jako Twój użytkownik LDAP/AD, z pełną rozliczalnością w audit logach.
+- Hasło trafia tylko do `oc` i nie jest zapisywane. Skrypty go nie widzą.
+- Hasło jest wysyłane wyłącznie do serwerów z zaufanym certyfikatem.
+- Tokeny sesji wygasają (domyślnie 24h), a `ocp-logout` unieważnia je na klastrze.
+- Kubeconfigi mają uprawnienia `600`, a katalog `~/.kube/clusters` ma `700`.
+- Tokeny nie są przenoszone przy migracji ani zapisywane w backupach `ocp-remove`.
